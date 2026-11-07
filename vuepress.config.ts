@@ -1,8 +1,8 @@
 {
   mountPath: "/BilupDesktop",
   analysis: githubReleasesFilesAnalysis({
-  user: "Bilup",
-  repository: "desktop",
-})
+    user: "Bilup",
+    repository: "desktop",
+  })
   downProxy: cloudflarePagesDownProxy(),
 }
