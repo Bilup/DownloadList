@@ -9,7 +9,7 @@ export default defineUserConfig({
   pagePatterns: [],
   lang: 'zh-CN',
   public: `.vuepress/public`,
-  title: 'Bilup',
+  title: 'Bilup Desktop',
   description: 'Bilup - 更好的Turbowarp',
   head: [['link', { rel: 'icon', href: '/Logo.svg' }]],
   shouldPrefetch: true,
