@@ -1,28 +1,31 @@
 import { DownProxy } from "../../base/AllAnalysis.js";
 import { writeFileSync, mkdirSync } from "fs";
-import { downloadProxy } from "../cloudflarePagesDownProxy/worker/cloudflarePagesDownloadPorxy.js";
 import { onExtendsBundlerOptions, onGenerated } from "../../base/eventManager.js";
 import { ProxyOptions } from "vite";
 import { path } from "vuepress/utils";
+import { createHash } from "crypto";
+import { bundleProxyWorker, ProxyEntry, resolveWorkerEntry } from "../proxyWorkerBundle.js";
 
-const outputPath = process.env.VERCEL_URL? '/vercel/output' : "./.vercel/output";
-console.log("vercel out path is",outputPath);
-/**
- * 生成一个字符串的hashcode
- * */
-function hashCode(string: string): number {
-    let hash = 0, i, chr;
-    if (string.length === 0) return hash;
-    for (i = 0; i < string.length; i++) {
-        chr = string.charCodeAt(i);
-        hash = ((hash << 5) - hash) + chr;
-        hash |= 0; // Convert to 32bit integer
-    }
-    return hash;
+const outputPath = process.env.VERCEL_URL ? '/vercel/output' : "./.vercel/output";
+console.log("vercel out path is", outputPath);
+
+const PROXY_PREFIX = "/api/verceldown/";
+
+/** 代理条目的键 -> 条目 */
+const proxyConfig: { [key: string]: ProxyEntry } = {};
+
+/** Worker 行为配置 */
+const proxyOptions = {
+    /** 边缘缓存 TTL（秒）：7 天 */
+    cacheTtl: 604800,
+    /** 是否在响应头回显客户端地址族（默认关闭，避免污染边缘缓存） */
+    exposeClientInfo: false
+};
+
+/** 计算源地址的稳定键 */
+function sourceKey(sourceUrl: string): string {
+    return createHash("sha1").update(sourceUrl).digest("hex").slice(0, 16);
 }
-
-const proxyConfig: { [path: string]: string } = {}
-
 
 async function vercelReleaseConfigurationFile(destPath: string) {
     mkdirSync(path.join(outputPath, "functions/api/verceldown.func"), { recursive: true });
@@ -31,7 +34,10 @@ async function vercelReleaseConfigurationFile(destPath: string) {
         "deploymentTarget": "v8-worker",
         "entrypoint": "verceldown.js"
     }));
-    writeFileSync(path.join(outputPath, "functions/api/verceldown.func/verceldown.js"), `${downloadProxy.toString()}\nconst proxyConfig = ${JSON.stringify(proxyConfig)}\nexport default (req)=>downloadProxy(req,proxyConfig);export const config = { runtime: 'edge' };`);
+    const entry = resolveWorkerEntry(import.meta.url, "worker/entry.ts");
+    const workerSource = await bundleProxyWorker(entry, proxyConfig, proxyOptions);
+    writeFileSync(path.join(outputPath, "functions/api/verceldown.func/verceldown.js"),
+        workerSource + "\nexport const config = { runtime: 'edge' };");
 }
 
 /**
@@ -45,12 +51,17 @@ onExtendsBundlerOptions(async (options, app) => {
     if (app.options.bundler.name === '@vuepress/bundler-vite') {
         const proxy: Record<string, string | ProxyOptions> = {};
         for (const proxyConfigKey in proxyConfig) {
-            const proxyConfigValue = proxyConfig[proxyConfigKey];
-            proxy[proxyConfigKey] = {
+            const proxyConfigValue = proxyConfig[proxyConfigKey].url;
+            proxy[PROXY_PREFIX + proxyConfigKey + "/**"] = {
                 target: new URL(proxyConfigValue).toString(),
                 changeOrigin: true,
-                rewrite: () => "",
-                followRedirects: true,
+                rewrite: (requestPath: string) => {
+                    const target = new URL(proxyConfigValue);
+                    const idx = requestPath.indexOf("/**");
+                    const rest = idx >= 0 ? requestPath.slice(idx + 3) : "";
+                    return target.pathname + rest + target.search;
+                },
+                followRedirects: true
             };
         }
         options.viteOptions ??= {};
@@ -60,9 +71,13 @@ onExtendsBundlerOptions(async (options, app) => {
 });
 
 async function vercelDownProxyInner(sourceUrl: string, fileName: string, contentType?: string): Promise<string> {
-    const downProxyPath = `/api/verceldown/${hashCode(sourceUrl)}/${encodeURIComponent(fileName)}`;
-    proxyConfig[downProxyPath] = sourceUrl;
-    return downProxyPath;
+    const key = sourceKey(sourceUrl);
+    proxyConfig[key] = {
+        url: sourceUrl,
+        name: fileName,
+        type: contentType
+    };
+    return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName);
 }
 
 
@@ -74,7 +89,3 @@ function vercelDownProxy(): DownProxy {
 }
 
 export default vercelDownProxy;
-
-
-
-

@@ -1,0 +1,28 @@
+# Cloudflare Pages 部署配置
+#
+# 项目：bilup-download-list
+# 构建命令：npm run build
+# 输出目录：.vuepress/dist
+#
+# 构建产物中包含：
+#   _worker.js    —— 下载代理 Worker（esbuild 打包，含代理表）
+#   _routes.json  —— Pages 路由规则，把 /down/** 交给 Worker 处理
+#
+# 兼容性设置：
+#   nodejs_compat 让 Worker 运行时获得 Node 内置 API，
+#   便于代理逻辑使用 URL / Headers 等标准对象。
+#
+# IPv4/IPv6 说明：
+#   Cloudflare Pages 的 pages.dev 域名默认同时提供 A 与 AAAA 记录，
+#   站点本身即为 IPv4/IPv6 双栈访问，无需额外 DNS 配置。
+#   源站侧的双栈能力由 Cloudflare 网络自身的 IPv4/IPv6 回源策略保证。
+
+name = "bilup-download-list"
+compatibility_date = "2026-11-08"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = ".vuepress/dist"
+
+# 代理表较大，_worker.js 需要单独较高的压缩阈值，
+# 避免构建时对 Worker 产物做过重的压缩而拖慢构建。
+[build]
+command = "npm run build"

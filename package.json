@@ -17,6 +17,7 @@
     "@vuepress/plugin-nprogress": "2.0.0-rc.38",
     "aplayer": "^1.10.1",
     "artplayer": "^5.1.7",
+    "esbuild": "^0.21.5",
     "markdown-it": "^14.1.0",
     "pdf-vue3": "^1.0.12",
     "typescript": "^5.5.4",
