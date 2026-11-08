@@ -2,7 +2,7 @@ name: Deploy to GitHub Pages
 
 on:
   push:
-分支: [main]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -89,6 +89,9 @@ jobs:
       - name: Build
         id: build
         working-directory: ${{ steps.detect.outputs.root }}
+        env:
+          # GitHub API 访问令牌，用于提升 API 速率限制并避免匿名请求被限流
+          githubToken: ${{ secrets.githubToken }}
         run: |
           if [ ! -f package.json ]; then
             echo "No build step, using root as output"
@@ -104,7 +107,9 @@ jobs:
             echo "No build script found"; exit 1
           fi
 
-          for d in dist out build public _site docs/.vitepress/dist .vitepress/dist; do
+          # 按优先级探测构建输出目录
+          # 注意：本项目使用 VuePress 2，输出目录为 .vuepress/dist
+          for d in .vuepress/dist dist out build public _site docs/.vuepress/dist docs/.vitepress/dist .vitepress/dist; do
             if [ -d "$d" ]; then
               echo "output=${{ steps.detect.outputs.root }}/$d" >> $GITHUB_OUTPUT
               exit 0
@@ -114,6 +119,9 @@ jobs:
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
+        with:
+          # 仓库未启用 Pages 时自动启用，避免工作流因缺少 Pages 配置而失败
+          enablement: true
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
