@@ -9,11 +9,32 @@
  *    得到的数据会损坏。固定 identity 后 content-length 与字节流严格一致，
  *    Range 语义正确。
  *
+/**
  * 2. 边缘缓存使用 `cf.cacheEverything` + `cf.cacheTtl`
  *    GitHub Release 资源最终落到 Azure Blob，其响应没有 Cache-Control，
  *    Cloudflare 默认不缓存（实测 cf-cache-status: DYNAMIC）。
  *    开启 cacheEverything 后大文件可命中边缘缓存（实测 HIT，字节数与
  *    源站一致，magic bytes 正确）。
+ *
+ * 2.1 回源主路径必须是「路径稳定」的 URL
+ *    实测结论（对比实验，四种策略同一文件对照）：
+ *      - 原始 URL（github.com/.../releases/download/...）
+ *        首次 MISS 后持续 HIT，命中率 15/15
+ *      - asset API 的 302 目标（release-assets.githubusercontent.com）
+ *        Location 带时效签名（se/sig 参数），每次都不同，
+ *        缓存键随之抖动，命中率仅约 6 成
+ *    因此主路径用原始 URL，asset API 签名地址降为兜底。
+ *
+ * 2.2 cf.cacheKey 对跨到 GitHub 的子请求无效
+ *    文档称 cacheKey 可固定缓存键，但实测对 github.com 的子请求
+ *    仍然按最终 URL（含签名）计算缓存键，设置后依旧 MISS。
+ *    该选项保留但不依赖它。
+ *
+ * 2.3 模块级缓存（isolate 内存）
+ *    - assetId -> 签名 URL：签名有效期约 5 分钟，缓存 4 分钟，
+ *      可把 GitHub API 调用量降低一到两个数量级。
+ *    - KV 代理表 / 令牌：KV 读取本身有 30 秒最小边缘缓存，
+ *      再叠加模块级缓存后，稳态下每请求的 KV 读次数可降到 0。
  *
  * 3. 不使用 Cache API 存储大文件
  *    实测 caches.default.put() 写入 162MB 响应失败：
@@ -98,6 +119,12 @@ export async function loadProxyConfigFromKV(
     fallback: { [key: string]: ProxyEntry }
 ): Promise<{ [key: string]: ProxyEntry }> {
     if (!kv) return fallback;
+
+    // 模块级缓存命中则直接返回，避免每次下载都打 KV。
+    // 缓存丢失只会导致多读一次 KV，不影响正确性。
+    const cached = readModuleCache(proxyTableCache);
+    if (cached) return cached;
+
     try {
         const raw = await kv.get(KV_TABLE_KEY, "text");
         if (typeof raw !== "string" || raw.length === 0) return fallback;
@@ -112,6 +139,7 @@ export async function loadProxyConfigFromKV(
                 merged[k] = entry as ProxyEntry;
             }
         });
+        proxyTableCache = { value: merged, expiresAt: Date.now() + PROXY_TABLE_TTL_MS };
         return merged;
     } catch (error) {
         return fallback;
@@ -166,6 +194,69 @@ export function buildAssetApiUrl(sourceUrl: string, assetId: number): string | u
 /** KV 中存放 GitHub 令牌的 key */
 export const KV_TOKEN_KEY = "github-token";
 
+/**
+ * 模块级（isolate 内存）缓存。
+ *
+ * Workers 的 isolate 会在内存不足时被回收重建，因此这里的所有条目
+ * 都必须能「丢失后重新获取」，不能成为正确性的前提。
+ *
+ * 作用是把高频重复的外部调用挡在isolate 之外：
+ * - 签名 URL：避免每次下载都打一次 GitHub asset API（限额 5000 次/小时）
+ * - KV 代理表与令牌：避免每次下载都读 KV（Free 计划 10 万读/天）
+ */
+interface ModuleCacheEntry<T> {
+    value: T;
+    expiresAt: number;
+}
+
+/** 签名 URL 的缓存时长：GitHub 签名约 5 分钟有效，取 4 分钟留出余量 */
+const SIGNED_URL_TTL_MS = 4 * 60 * 1000;
+
+/** KV 代理表的模块级缓存时长：与 KV 自身 30 秒边缘缓存叠加，取 60 秒 */
+const PROXY_TABLE_TTL_MS = 60 * 1000;
+
+/** GitHub 令牌的模块级缓存时长：令牌有效期以小时计，取 5 分钟 */
+const TOKEN_TTL_MS = 5 * 60 * 1000;
+
+/** assetId -> 签名后的实际下载地址 */
+const signedUrlCache = new Map<string, ModuleCacheEntry<string>>();
+
+/** KV 代理表的模块级缓存 */
+let proxyTableCache: ModuleCacheEntry<{ [key: string]: ProxyEntry }> | undefined;
+
+/** GitHub 令牌的模块级缓存 */
+let tokenCache: ModuleCacheEntry<string> | undefined;
+
+/**
+ * 解析 GitHub asset API 重定向目标中的签名过期时间。
+ *
+ * release-assets.githubusercontent.com 的 Location 形如：
+ * https://release-assets.githubusercontent.com/...?se=2026-11-08T12%3A00%3A00Z&sig=...
+ * 其中 se 即签名过期时间（URL 编码后的 ISO 8601）。
+ *
+ * 解析失败时返回 0，表示「无法判断过期时间」，由调用方按 TTL 保守处理。
+ */
+export function parseSignedExpiry(location: string): number {
+    const match = /[?&]se=([^&]+)/.exec(location);
+    if (!match) return 0;
+    try {
+        const decoded = decodeURIComponent(match[1]);
+        const parsed = Date.parse(decoded);
+        return Number.isFinite(parsed) ? parsed : 0;
+    } catch (error) {
+        return 0;
+    }
+}
+
+/**
+ * 读取模块级缓存，命中且未过期则返回。
+ */
+function readModuleCache<T>(entry: ModuleCacheEntry<T> | undefined): T | undefined {
+    if (!entry) return undefined;
+    if (Date.now() >= entry.expiresAt) return undefined;
+    return entry.value;
+}
+
 /** 检测访客使用的 IP 地址族 */
 export function detectClientFamily(request: Request): { family: string; ip: string; ipv6: string } {
     const ipv6 = request.headers.get("cf-connecting-ipv6") || "";
@@ -215,7 +306,10 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     }
 
     // 诊断端点：返回当前请求的地址族、边缘节点等实时信息（不缓存）
-    if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0) {
+    // 注意：_routes.json 只把 /down/** 交给 Worker，因此诊断路径必须落在 /down/ 之下，
+    // 否则会被静态资源路由接管，永远到不了这里。
+    if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0
+        && url.pathname.indexOf("/down/") === 0) {
         const info = detectClientFamily(request);
         const cf = (request as any).cf || {};
         return new Response(JSON.stringify({
@@ -228,7 +322,12 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
             country: cf.country || null,
             clientTcpRtt: cf.clientTcpRtt === undefined ? null : cf.clientTcpRtt,
             clientQuicRtt: cf.clientQuicRtt === undefined ? null : cf.clientQuicRtt,
-            requestUrl: url.pathname
+            requestUrl: url.pathname,
+            moduleCache: {
+                signedUrlCount: signedUrlCache.size,
+                proxyTableCached: readModuleCache(proxyTableCache) !== undefined,
+                tokenCached: readModuleCache(tokenCache) !== undefined
+            }
         }, null, 2), {
             headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
         });
@@ -258,29 +357,67 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
 
     const ttl = typeof opt.cacheTtl === "number" && opt.cacheTtl > 0 ? opt.cacheTtl : 604800;
 
-    const cacheOptions = {
-        cacheEverything: true,
-        cacheTtl: ttl,
-        cacheTtlByStatus: { "200-299": ttl, "300-399": -1, "400-599": -1 }
-    } as any;
+    /**
+     * 回源时的边缘缓存选项。
+     *
+     * cacheEverything：源站（Azure Blob）不带 Cache-Control，默认不缓存，
+     * 必须显式开启，否则永远 DYNAMIC。
+     *
+     * cacheKey：把子请求的缓存键固定为「稳定的源站 URL」。
+     * 这是本次改造的核心 —— asset API 的 302 目标带时效签名，
+     * 每次都不同，不固定缓存键就永远 MISS。
+     *
+     * 注意：cacheKey 替换的是「路径与查询串」部分，
+     * 因此传入的是源站 URL 的 path+query，而非完整 URL，
+     * 避免把 https:// 前缀也计入键中。
+     */
+    function buildCacheOptions(stableKey: string): any {
+        return {
+            cacheEverything: true,
+            cacheTtl: ttl,
+            cacheTtlByStatus: { "200-299": ttl, "300-399": -1, "400-599": -1 },
+            cacheKey: stableKey
+        };
+    }
+
+    /**
+     * 从源站 URL 中提取稳定的缓存键成分（path + query，去掉 origin）。
+     */
+    function toStableCacheKey(sourceUrl: string): string {
+        try {
+            const parsed = new URL(sourceUrl);
+            return parsed.pathname + parsed.search;
+        } catch (error) {
+            return sourceUrl;
+        }
+    }
 
     /**
      * 依次尝试若干个源地址，返回第一个可用响应。
      *
-     * 5xx/504 多为源站侧对当前出口 IP 的拒绝，此时尝试下一个候选。
+     * 5xx/504 多为源站侧对当前出口 IP 的拒绝，404 则可能是该条路径
+     * 已被源站调整（如 release 重新发布后路径失效），
+     * 两种情况都应继续尝试下一个候选。
+     *
+     * @param onUse 选中某个候选时的回调，用于记录实际走的是哪条路径
      */
-    async function fetchOrigin(candidates: Array<{ url: string; headers: Headers }>): Promise<Response | undefined> {
+    async function fetchOrigin(
+        candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>,
+        onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void
+    ): Promise<Response | undefined> {
         for (const candidate of candidates) {
             try {
                 const response = await fetch(candidate.url, {
                     method: method,
                     headers: candidate.headers,
                     redirect: "follow",
-                    cf: cacheOptions
+                    cf: buildCacheOptions(candidate.cacheKey || candidate.url)
                 } as any);
-                if (response.status === 504 || response.status === 502) {
+                if (response.status === 504 || response.status === 502 || response.status === 404) {
+                    try { await response.body?.cancel(); } catch (e) { /* 忽略 */ }
                     continue;
                 }
+                if (onUse) onUse(candidate);
                 return response;
             } catch (error) {
                 continue;
@@ -289,36 +426,137 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         return undefined;
     }
 
-    // 组装候选源地址：asset API（需要令牌）优先，原始 URL 兜底
-    const candidates: Array<{ url: string; headers: Headers }> = [];
-    if (entry.assetId) {
-        const assetUrl = buildAssetApiUrl(entry.url, entry.assetId);
-        if (assetUrl) {
-            const token = kv ? await kv.get(KV_TOKEN_KEY, "text") : null;
-            if (token && typeof token === "string" && token.length > 0) {
-                const assetHeaders = new Headers();
-                assetHeaders.set("accept", "application/octet-stream");
-                assetHeaders.set("authorization", "Bearer " + token);
-                assetHeaders.set("x-github-api-version", "2022-11-28");
-                assetHeaders.set("user-agent", originHeaders.get("user-agent") || "bilup-download-proxy");
-                assetHeaders.set("accept-encoding", "identity");
-                for (const name of ["range", "if-range", "if-none-match", "if-modified-since"]) {
-                    const value = request.headers.get(name);
-                    if (value) assetHeaders.set(name, value);
-                }
-                candidates.push({ url: assetUrl, headers: assetHeaders });
+    /**
+     * 读取 GitHub 令牌（模块级缓存优先）。
+     */
+    async function getToken(): Promise<string | null> {
+        const cached = readModuleCache(tokenCache);
+        if (cached) return cached;
+        if (!kv) return null;
+        try {
+            const raw = await kv.get(KV_TOKEN_KEY, "text");
+            if (typeof raw === "string" && raw.length > 0) {
+                tokenCache = { value: raw, expiresAt: Date.now() + TOKEN_TTL_MS };
+                return raw;
             }
+            return null;
+        } catch (error) {
+            return null;
         }
     }
-    candidates.push({ url: entry.url, headers: originHeaders });
+
+    /**
+     * 通过 asset API 换取真实的签名下载地址。
+     *
+     * 这里手动处理重定向（redirect: "manual"），目的有二：
+     * 1. 拿到 Location 里的签名与过期时间，便于缓存与过期重试；
+     * 2. 后续对签名 URL 的请求可以带上稳定的 cacheKey，让边缘缓存命中。
+     *
+     * @returns 签名地址；无法获取时返回 undefined
+     */
+    async function resolveSignedUrl(assetId: number, sourceUrl: string, headers: Headers): Promise<string | undefined> {
+        const cacheKey = String(assetId);
+        const cached = readModuleCache(signedUrlCache.get(cacheKey));
+        if (cached) return cached;
+
+        const assetUrl = buildAssetApiUrl(sourceUrl, assetId);
+        if (!assetUrl) return undefined;
+        const token = await getToken();
+        if (!token) return undefined;
+
+        const assetHeaders = new Headers();
+        assetHeaders.set("accept", "application/octet-stream");
+        assetHeaders.set("authorization", "Bearer " + token);
+        assetHeaders.set("x-github-api-version", "2022-11-28");
+        assetHeaders.set("user-agent", headers.get("user-agent") || "bilup-download-proxy");
+        assetHeaders.set("accept-encoding", "identity");
+        // Range 交给后续对签名 URL 的请求处理，这里不带 Range，
+        // 避免把分段请求的语义带到重定向解析阶段。
+        assetHeaders.set("cache-control", "no-store");
+
+        try {
+            const response = await fetch(assetUrl, {
+                method: "GET",
+                headers: assetHeaders,
+                redirect: "manual"
+            } as any);
+            const location = response.headers.get("location");
+            if (!location) return undefined;
+
+            // 按签名中的过期时间决定缓存时长；解析不出则用保守的默认 TTL
+            const expiry = parseSignedExpiry(location);
+            const ttlMs = expiry > 0
+                ? Math.max(0, Math.min(expiry - Date.now() - 30 * 1000, SIGNED_URL_TTL_MS))
+                : SIGNED_URL_TTL_MS;
+            // 剩余有效期过短时不缓存，避免缓存一个马上要失效的地址
+            if (ttlMs > 0) {
+                signedUrlCache.set(cacheKey, { value: location, expiresAt: Date.now() + ttlMs });
+            }
+            return location;
+        } catch (error) {
+            return undefined;
+        }
+    }
+
+    // 组装候选源地址：原始 URL 优先，签名后的 asset 地址兜底
+    //
+    // 顺序很重要（实测结论）：
+    // - 原始 URL（github.com/.../releases/download/...）的路径稳定，
+    //   边缘缓存键稳定，实测首次 MISS 后持续 HIT。
+    // - asset API 的 302 目标带时效签名（se/sig），每次都不同，
+    //   即使显式指定 cf.cacheKey 也会被 Cloudflare 忽略（跨到 GitHub 的
+    //   子请求按最终 URL 计算缓存键），实测命中率仅约 6 成。
+    // 因此以原始 URL 为主路径，签名地址仅在原始 URL 不可用时兜底。
+    const stableCacheKey = toStableCacheKey(entry.url);
+    const candidates: Array<{ url: string; headers: Headers; cacheKey?: string }> = [];
+    candidates.push({ url: entry.url, headers: originHeaders, cacheKey: stableCacheKey });
+    if (entry.assetId) {
+        const signed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
+        if (signed) {
+            const signedHeaders = new Headers(originHeaders);
+            candidates.push({ url: signed, headers: signedHeaders, cacheKey: stableCacheKey });
+        }
+    }
 
     let originResponse: Response;
+    let usedSignedUrl = false;
     try {
-        const result = await fetchOrigin(candidates);
+        const result = await fetchOrigin(candidates, function (candidate) {
+            usedSignedUrl = candidate.url !== entry.url;
+        });
         if (!result) {
             throw new Error("所有候选源地址均不可用");
         }
         originResponse = result;
+
+        /**
+         * 签名过期重试。
+         *
+         * 签名 URL 有时效（约 5 分钟），若缓存的签名在取回时恰好过期，
+         * 源站会返回 403/404。此时丢弃缓存的签名、重新换取一个新的签名，
+         * 再试一次。这条路径只在「实际走的是签名地址」且「签名失效」时触发，
+         * 正常情况下第一次就能拿到内容。
+         *
+         * 若主路径（原始 URL）本身返回 404，说明资源确实不存在，
+         * 不做签名重试，避免无谓的 GitHub API 调用。
+         */
+        if (usedSignedUrl && (originResponse.status === 403 || originResponse.status === 404) && entry.assetId) {
+            signedUrlCache.delete(String(entry.assetId));
+            const refreshed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
+            if (refreshed) {
+                const retry = await fetchOrigin([
+                    { url: refreshed, headers: new Headers(originHeaders), cacheKey: stableCacheKey }
+                ]);
+                if (retry) {
+                    try {
+                        await originResponse.body?.cancel();
+                    } catch (error) {
+                        // 忽略取消失败，原始响应体未消费时无需处理
+                    }
+                    originResponse = retry;
+                }
+            }
+        }
     } catch (error) {
         const message = error && (error as any).message ? (error as any).message : String(error);
         return new Response("Upstream fetch failed: " + message, {
@@ -342,6 +580,8 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     const originCacheStatus = originResponse.headers.get("cf-cache-status");
     if (originCacheStatus) {
         responseHeaders.set("x-proxy-cache-status", originCacheStatus);
+    } else {
+        responseHeaders.set("x-proxy-cache-status", "UNKNOWN");
     }
     // 边缘回源耗时信息，便于观测加速效果
     const originAge = originResponse.headers.get("age");
