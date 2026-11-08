@@ -16,19 +16,21 @@
  *    开启 cacheEverything 后大文件可命中边缘缓存（实测 HIT，字节数与
  *    源站一致，magic bytes 正确）。
  *
- * 2.1 回源必须使用稳定的缓存键
- *    asset API 会 302 到 release-assets.githubusercontent.com，
- *    其 Location 带有时效签名（?se=...&sig=...），**每次请求都不同**。
- *    若直接跟随重定向，Cloudflare 的缓存键会随签名变化，
- *    实测表现为 x-proxy-cache-status 恒为 MISS、永远不命中边缘缓存，
- *    每次下载都实打实回源（并额外消耗一次 GitHub API 调用）。
+ * 2.1 回源主路径必须是「路径稳定」的 URL
+ *    实测结论（对比实验，四种策略同一文件对照）：
+ *      - 原始 URL（github.com/.../releases/download/...）
+ *        首次 MISS 后持续 HIT，命中率 15/15
+ *      - asset API 的 302 目标（release-assets.githubusercontent.com）
+ *        Location 带时效签名（se/sig 参数），每次都不同，
+ *        缓存键随之抖动，命中率仅约 6 成
+ *    因此主路径用原始 URL，asset API 签名地址降为兜底。
  *
- *    解决办法：使用 `cf.cacheKey` 把子请求的缓存键固定为源站稳定 URL。
- *    这样无论后端签名如何变化，边缘缓存都只有一份条目。
- *    注意：cacheKey 仅对「同账户内调用」或「非 Cloudflare 主机」生效，
- *    GitHub / release-assets 均为非 Cloudflare 主机，因此可用。
+ * 2.2 cf.cacheKey 对跨到 GitHub 的子请求无效
+ *    文档称 cacheKey 可固定缓存键，但实测对 github.com 的子请求
+ *    仍然按最终 URL（含签名）计算缓存键，设置后依旧 MISS。
+ *    该选项保留但不依赖它。
  *
- * 2.2 模块级缓存（isolate 内存）
+ * 2.3 模块级缓存（isolate 内存）
  *    - assetId -> 签名 URL：签名有效期约 5 分钟，缓存 4 分钟，
  *      可把 GitHub API 调用量降低一到两个数量级。
  *    - KV 代理表 / 令牌：KV 读取本身有 30 秒最小边缘缓存，
@@ -494,60 +496,6 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         } catch (error) {
             return undefined;
         }
-    }
-
-    /**
-     * 缓存策略对照实验端点（仅用于验证，不参与正常下载路径）。
-     *
-     * 依次用多种方式请求同一个源站，对比各自的 cf-cache-status，
-     * 用于确定哪种缓存键写法能稳定命中边缘缓存。
-     */
-    if (url.pathname.split("/").filter(Boolean).indexOf("_probe") >= 0
-        && url.pathname.indexOf("/down/") === 0) {
-        const targetKey = url.pathname.split("/").filter(Boolean)[2] || "";
-        const probeEntry = findProxyEntry("/" + targetKey, proxyConfig);
-        if (!probeEntry || !probeEntry.url) {
-            return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
-        }
-        const results: Array<Record<string, unknown>> = [];
-        const probe = async (label: string, target: string, key: string | undefined, headers: Headers) => {
-            try {
-                const r = await fetch(target, {
-                    method: "GET",
-                    headers: headers,
-                    redirect: "follow",
-                    cf: buildCacheOptions(key || target)
-                } as any);
-                results.push({
-                    strategy: label,
-                    status: r.status,
-                    cfCacheStatus: r.headers.get("cf-cache-status") || null,
-                    age: r.headers.get("age") || null
-                });
-                try { await r.body?.cancel(); } catch (e) { /* 忽略 */ }
-            } catch (error) {
-                results.push({ strategy: label, error: String(error).slice(0, 120) });
-            }
-        };
-        const plain = new Headers();
-        plain.set("accept-encoding", "identity");
-        plain.set("user-agent", "bilup-cache-probe");
-
-        // 策略 1：原始 URL，不带 cacheKey
-        await probe("origin-plain", probeEntry.url, undefined, new Headers(plain));
-        // 策略 2：原始 URL + cacheKey=path+query
-        await probe("origin-cachekey", probeEntry.url, toStableCacheKey(probeEntry.url), new Headers(plain));
-        // 策略 3/4：签名 URL，分别带与不带 cacheKey
-        if (probeEntry.assetId) {
-            const signed = await resolveSignedUrl(probeEntry.assetId, probeEntry.url, plain);
-            if (signed) {
-                await probe("signed-cachekey", signed, toStableCacheKey(probeEntry.url), new Headers(plain));
-                await probe("signed-plain", signed, undefined, new Headers(plain));
-            }
-        }
-        return new Response(JSON.stringify({ targetKey, results }, null, 2), {
-            headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
-        });
     }
 
     // 组装候选源地址：原始 URL 优先，签名后的 asset 地址兜底
