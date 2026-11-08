@@ -22,7 +22,6 @@ export default defineUserConfig({
         authorizationToken: process.env.githubToken,
         per_page: 10,
       }),
-      hideReadme: true,
       downProxy: cloudflarePagesDownProxy(),
     },
   ])
