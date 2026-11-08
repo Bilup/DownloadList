@@ -393,9 +393,16 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     /**
      * 依次尝试若干个源地址，返回第一个可用响应。
      *
-     * 5xx/504 多为源站侧对当前出口 IP 的拒绝，此时尝试下一个候选。
+     * 5xx/504 多为源站侧对当前出口 IP 的拒绝，404 则可能是该条路径
+     * 已被源站调整（如 release 重新发布后路径失效），
+     * 两种情况都应继续尝试下一个候选。
+     *
+     * @param onUse 选中某个候选时的回调，用于记录实际走的是哪条路径
      */
-    async function fetchOrigin(candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>): Promise<Response | undefined> {
+    async function fetchOrigin(
+        candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>,
+        onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void
+    ): Promise<Response | undefined> {
         for (const candidate of candidates) {
             try {
                 const response = await fetch(candidate.url, {
@@ -404,9 +411,11 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                     redirect: "follow",
                     cf: buildCacheOptions(candidate.cacheKey || candidate.url)
                 } as any);
-                if (response.status === 504 || response.status === 502) {
+                if (response.status === 504 || response.status === 502 || response.status === 404) {
+                    try { await response.body?.cancel(); } catch (e) { /* 忽略 */ }
                     continue;
                 }
+                if (onUse) onUse(candidate);
                 return response;
             } catch (error) {
                 continue;
@@ -541,23 +550,32 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         });
     }
 
-    // 组装候选源地址：签名后的 asset 地址优先，原始 URL 兜底
+    // 组装候选源地址：原始 URL 优先，签名后的 asset 地址兜底
+    //
+    // 顺序很重要（实测结论）：
+    // - 原始 URL（github.com/.../releases/download/...）的路径稳定，
+    //   边缘缓存键稳定，实测首次 MISS 后持续 HIT。
+    // - asset API 的 302 目标带时效签名（se/sig），每次都不同，
+    //   即使显式指定 cf.cacheKey 也会被 Cloudflare 忽略（跨到 GitHub 的
+    //   子请求按最终 URL 计算缓存键），实测命中率仅约 6 成。
+    // 因此以原始 URL 为主路径，签名地址仅在原始 URL 不可用时兜底。
     const stableCacheKey = toStableCacheKey(entry.url);
     const candidates: Array<{ url: string; headers: Headers; cacheKey?: string }> = [];
+    candidates.push({ url: entry.url, headers: originHeaders, cacheKey: stableCacheKey });
     if (entry.assetId) {
         const signed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
         if (signed) {
             const signedHeaders = new Headers(originHeaders);
-            // 对签名 URL 的请求，缓存键固定为原始源站 URL 的 path+query。
-            // 签名会变，但缓存键不变，边缘缓存才能真正命中。
             candidates.push({ url: signed, headers: signedHeaders, cacheKey: stableCacheKey });
         }
     }
-    candidates.push({ url: entry.url, headers: originHeaders, cacheKey: stableCacheKey });
 
     let originResponse: Response;
+    let usedSignedUrl = false;
     try {
-        const result = await fetchOrigin(candidates);
+        const result = await fetchOrigin(candidates, function (candidate) {
+            usedSignedUrl = candidate.url !== entry.url;
+        });
         if (!result) {
             throw new Error("所有候选源地址均不可用");
         }
@@ -568,10 +586,13 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
          *
          * 签名 URL 有时效（约 5 分钟），若缓存的签名在取回时恰好过期，
          * 源站会返回 403/404。此时丢弃缓存的签名、重新换取一个新的签名，
-         * 再试一次。这条路径只在签名失效的边界情况触发，
+         * 再试一次。这条路径只在「实际走的是签名地址」且「签名失效」时触发，
          * 正常情况下第一次就能拿到内容。
+         *
+         * 若主路径（原始 URL）本身返回 404，说明资源确实不存在，
+         * 不做签名重试，避免无谓的 GitHub API 调用。
          */
-        if ((originResponse.status === 403 || originResponse.status === 404) && entry.assetId) {
+        if (usedSignedUrl && (originResponse.status === 403 || originResponse.status === 404) && entry.assetId) {
             signedUrlCache.delete(String(entry.assetId));
             const refreshed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
             if (refreshed) {
