@@ -3,11 +3,12 @@ import { FileList } from "vuepress-theme-flist";
 
 export default defineUserConfig({
   lang: "zh-CN",
-  title: "DLGrass",
-  description: "我的文件列表",
+  title: "Bilup Desktop",
+  description: "Bilup客户端官方下载站",
 
   theme: FileList({
     logo: "/Logo.svg",
+    
     fileList: [
       {
         mountPath: "/BilupDesktop",
