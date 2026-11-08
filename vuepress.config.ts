@@ -17,11 +17,14 @@ export default defineUserConfig({
       :root {
         --logo-color: #7AB2C5 !important;
       }
+      footer, .footer, .vp-footer, [class*="footer"], [class*="Footer"] {
+        display: none !important;
+      }
     `]
   ],
   shouldPrefetch: true,
   theme: FileList({
-    footer: "", 
+    footer: "",
     fileList: [
       {
         mountPath: "/",
