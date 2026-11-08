@@ -8,7 +8,7 @@ export default defineUserConfig({
   bundler: viteBundler(),
   pagePatterns: [],
   lang: 'zh-CN',
-  public: `./public`,
+  public: `.vuepress/public`,
   title: 'Bilup',
   description: 'Bilup - 更好的Turbowarp',
   head: [['link', { rel: 'icon', href: '/Logo.svg' }]],
