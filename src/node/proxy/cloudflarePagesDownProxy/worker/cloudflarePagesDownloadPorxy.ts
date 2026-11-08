@@ -304,7 +304,10 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     }
 
     // 诊断端点：返回当前请求的地址族、边缘节点等实时信息（不缓存）
-    if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0) {
+    // 注意：_routes.json 只把 /down/** 交给 Worker，因此诊断路径必须落在 /down/ 之下，
+    // 否则会被静态资源路由接管，永远到不了这里。
+    if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0
+        && url.pathname.indexOf("/down/") === 0) {
         const info = detectClientFamily(request);
         const cf = (request as any).cf || {};
         return new Response(JSON.stringify({
@@ -319,7 +322,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
             clientQuicRtt: cf.clientQuicRtt === undefined ? null : cf.clientQuicRtt,
             requestUrl: url.pathname,
             moduleCache: {
-                signedUrls: signedUrlCache.size,
+                signedUrlCount: signedUrlCache.size,
                 proxyTableCached: readModuleCache(proxyTableCache) !== undefined,
                 tokenCached: readModuleCache(tokenCache) !== undefined
             }
