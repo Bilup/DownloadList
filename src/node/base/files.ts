@@ -10,7 +10,16 @@ export interface FilesInfo{
 export interface File extends FilesInfo{
     downloadUrl:string,
     downloadCorsAllow:DownloadCorsAllow,
-    contentType?:string
+    contentType?:string,
+    /**
+     * GitHub Release 资源的 asset id。
+     *
+     * 存在时，下载代理可改用 GitHub asset API 回源
+     * （api.github.com/repos/{owner}/{repo}/releases/assets/{id}），
+     * 该路径跳转到的 release-assets.githubusercontent.com 不受
+     * Cloudflare 出口 IP 访问 /releases/download/** 的限制。
+     */
+    assetId?:number
 }
 export interface Folder extends FilesInfo{
     children:Array<File|Folder>

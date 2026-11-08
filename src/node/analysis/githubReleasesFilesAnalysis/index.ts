@@ -45,27 +45,30 @@ async function githubReleasesFileTree(config: GithubRepository): Promise<Folder>
             updated_at: string,
             size: number,
             content_type: string
+            id: number
         }[]
     }[];
     for (const { tag_name, name, body, published_at, assets } of jsonData) {
         const tagFolder: Folder = {
             title: name,
-            content: "", 
+            content: "",
             children: [],
             updateTime: new Date(published_at).getTime(),
             size: 0,
             name: "githubReleasesTagRoot"
         };
-        for (const { browser_download_url, size, name, updated_at, content_type } of assets) {
-            if (name.includes("Source code")) continue; 
-            
+        for (const { browser_download_url, size, name, updated_at, content_type, id } of assets) {
+            if (name.includes("Source code")) continue;
+
             joinFile(tagFolder, {
                 downloadUrl: browser_download_url,
                 updateTime: new Date(updated_at).getTime(),
                 size: size,
                 contentType: content_type,
                 name: name,
-                downloadCorsAllow: "loose", 
+                downloadCorsAllow: "loose",
+                // 记录 asset id，供下载代理改用 asset API 回源
+                assetId: id
             });
         }
         let tagPath: string = tag_name;

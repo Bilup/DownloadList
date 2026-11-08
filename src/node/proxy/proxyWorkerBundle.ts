@@ -19,6 +19,11 @@ export interface ProxyEntry {
     name?: string;
     type?: string;
     size?: number;
+    /**
+     * GitHub Release 资源的 asset id。
+     * 提供时代理优先用 asset API 回源（见 cloudflarePagesDownloadPorxy.ts）。
+     */
+    assetId?: number;
 }
 
 /** 代理行为配置 */

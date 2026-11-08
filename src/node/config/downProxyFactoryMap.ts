@@ -7,7 +7,7 @@ function downProxyModuleLoader(moduleLoader: () => Promise<ProxyModule>): (optio
   let loading: Promise<DownProxy> | undefined;
 
   return () => {
-    return async (sourceUrl, fileName, contentType) => {
+    return async (sourceUrl, fileName, contentType, assetId) => {
       if (!mod) {
         if (!loading) {
           loading = (async () => {
@@ -18,7 +18,7 @@ function downProxyModuleLoader(moduleLoader: () => Promise<ProxyModule>): (optio
         }
         mod = await loading;
       }
-      return mod(sourceUrl, fileName, contentType);
+      return mod(sourceUrl, fileName, contentType, assetId);
     };
   };
 }

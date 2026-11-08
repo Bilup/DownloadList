@@ -80,9 +80,12 @@ onExtendsBundlerOptions(async (options, app) => {
     }
 });
 
-async function vercelDownProxyInner(sourceUrl: string, fileName: string, contentType?: string): Promise<string> {
+async function vercelDownProxyInner(sourceUrl: string, fileName: string, contentType?: string, assetId?: number): Promise<string> {
     const key = sourceKey(sourceUrl);
     const entry: ProxyEntry = { url: sourceUrl, name: fileName, type: contentType };
+    if (typeof assetId === "number" && assetId > 0) {
+        entry.assetId = assetId;
+    }
     proxyConfig[key] = entry;
     // 登记旧版 hashCode 别名，保证历史链接继续可用
     const legacyKey = legacyHashCode(sourceUrl);
@@ -97,7 +100,7 @@ async function vercelDownProxyInner(sourceUrl: string, fileName: string, content
  * 使用vercel的下载代理
  * */
 function vercelDownProxy(): DownProxy {
-    return (sourceUrl, fileName, contentType) => vercelDownProxyInner(sourceUrl, fileName, contentType);
+    return (sourceUrl, fileName, contentType, assetId) => vercelDownProxyInner(sourceUrl, fileName, contentType, assetId);
 }
 
 export default vercelDownProxy;

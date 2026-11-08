@@ -165,6 +165,8 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # 供代理用 GitHub asset API 回源（GitHub 阻断 CF 出口 IP 直连 releases/download）
+          GITHUB_TOKEN: ${{ secrets.githubToken }}
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo "未配置 CLOUDFLARE_API_TOKEN，跳过代理表同步"

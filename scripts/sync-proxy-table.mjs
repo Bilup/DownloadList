@@ -10,8 +10,12 @@
  *
  * 同步 KV 不会触发重新部署，因此边缘缓存得以保留，下载速度不受影响。
  *
+ * 同时写入 GitHub 令牌：GitHub 会阻断 Cloudflare 出口 IP 直接访问
+ * /releases/download/**（实测返回 504），代理需要用令牌调 asset API 回源。
+ * 令牌从环境变量 GITHUB_TOKEN 读取，未设置则跳过（代理会回退到原始 URL）。
+ *
  * 用法：
- *   CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<id> \
+ *   CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<id> [GITHUB_TOKEN=<gh-token>] \
  *     node scripts/sync-proxy-table.mjs [代理表文件路径]
  */
 
@@ -24,6 +28,7 @@ const ROOT = resolve(HERE, "..");
 
 const KV_NAMESPACE_TITLE = "bilup-download-proxy";
 const KV_TABLE_KEY = "proxy-table";
+const KV_TOKEN_KEY = "github-token";
 const API = "https://api.cloudflare.com/client/v4";
 
 function env(name) {
@@ -95,6 +100,18 @@ async function main() {
         body: value
     });
     log(`已写入 KV (${namespaceId}): ${count} 条, ${value.length} 字节，约 60 秒内全网生效`);
+
+    // 写入 GitHub 令牌，供代理用 asset API 回源
+    const ghToken = process.env.GITHUB_TOKEN;
+    if (ghToken && ghToken.length > 0) {
+        await cf(`/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${KV_TOKEN_KEY}`, {
+            method: "PUT",
+            body: ghToken
+        });
+        log(`GitHub 令牌已写入 KV (${KV_TOKEN_KEY})`);
+    } else {
+        log(`未提供 GITHUB_TOKEN，跳过令牌写入（代理将回退到原始 URL，冷缓存可能 504）`);
+    }
 }
 
 main().catch((error) => {

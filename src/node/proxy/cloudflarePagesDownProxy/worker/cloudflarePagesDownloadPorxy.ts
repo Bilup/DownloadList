@@ -42,6 +42,16 @@ export interface ProxyEntry {
     type?: string;
     /** 文件大小 */
     size?: number;
+    /**
+     * GitHub Release 资源的 asset id。
+     *
+     * GitHub 会阻断 Cloudflare 出口 IP 直接访问
+     * `/releases/download/**`（实测返回 504），但 asset API
+     * （api.github.com/repos/{owner}/{repo}/releases/assets/{id}）
+     * 会 302 到 release-assets.githubusercontent.com，该域名不受此限制。
+     * 因此回源优先走 asset API，失败再回退到原始 URL。
+     */
+    assetId?: number;
 }
 
 /** 代理行为配置 */
@@ -127,7 +137,9 @@ export function isPreviewable(type?: string, name?: string): boolean {
     return previewExt.indexOf(ext.toLowerCase()) >= 0;
 }
 
-/** 构造 Content-Disposition，兼容非 ASCII 文件名 */
+/**
+ * 构造 Content-Disposition，兼容非 ASCII 文件名
+ */
 export function buildContentDisposition(name: string | undefined, inline: boolean): string | undefined {
     if (!name) return undefined;
     const ascii = name.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
@@ -135,6 +147,24 @@ export function buildContentDisposition(name: string | undefined, inline: boolea
     const type = inline ? "inline" : "attachment";
     return `${type}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
+
+/**
+ * 从 GitHub 的 browser_download_url 反推出 asset API 地址。
+ *
+ * https://github.com/{owner}/{repo}/releases/download/{tag}/{file}
+ *   -> https://api.github.com/repos/{owner}/{repo}/releases/assets/{id}
+ *
+ * asset id 无法从 URL 推导，必须在构建期从 API 取得并随条目一起保存；
+ * 此处仅在能拿到 assetId 时使用。
+ */
+export function buildAssetApiUrl(sourceUrl: string, assetId: number): string | undefined {
+    const match = /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/releases\/download\//.exec(sourceUrl);
+    if (!match) return undefined;
+    return `https://api.github.com/repos/${match[1]}/${match[2]}/releases/assets/${assetId}`;
+}
+
+/** KV 中存放 GitHub 令牌的 key */
+export const KV_TOKEN_KEY = "github-token";
 
 /** 检测访客使用的 IP 地址族 */
 export function detectClientFamily(request: Request): { family: string; ip: string; ipv6: string } {
@@ -228,18 +258,67 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
 
     const ttl = typeof opt.cacheTtl === "number" && opt.cacheTtl > 0 ? opt.cacheTtl : 604800;
 
+    const cacheOptions = {
+        cacheEverything: true,
+        cacheTtl: ttl,
+        cacheTtlByStatus: { "200-299": ttl, "300-399": -1, "400-599": -1 }
+    } as any;
+
+    /**
+     * 依次尝试若干个源地址，返回第一个可用响应。
+     *
+     * 5xx/504 多为源站侧对当前出口 IP 的拒绝，此时尝试下一个候选。
+     */
+    async function fetchOrigin(candidates: Array<{ url: string; headers: Headers }>): Promise<Response | undefined> {
+        for (const candidate of candidates) {
+            try {
+                const response = await fetch(candidate.url, {
+                    method: method,
+                    headers: candidate.headers,
+                    redirect: "follow",
+                    cf: cacheOptions
+                } as any);
+                if (response.status === 504 || response.status === 502) {
+                    continue;
+                }
+                return response;
+            } catch (error) {
+                continue;
+            }
+        }
+        return undefined;
+    }
+
+    // 组装候选源地址：asset API（需要令牌）优先，原始 URL 兜底
+    const candidates: Array<{ url: string; headers: Headers }> = [];
+    if (entry.assetId) {
+        const assetUrl = buildAssetApiUrl(entry.url, entry.assetId);
+        if (assetUrl) {
+            const token = kv ? await kv.get(KV_TOKEN_KEY, "text") : null;
+            if (token && typeof token === "string" && token.length > 0) {
+                const assetHeaders = new Headers();
+                assetHeaders.set("accept", "application/octet-stream");
+                assetHeaders.set("authorization", "Bearer " + token);
+                assetHeaders.set("x-github-api-version", "2022-11-28");
+                assetHeaders.set("user-agent", originHeaders.get("user-agent") || "bilup-download-proxy");
+                assetHeaders.set("accept-encoding", "identity");
+                for (const name of ["range", "if-range", "if-none-match", "if-modified-since"]) {
+                    const value = request.headers.get(name);
+                    if (value) assetHeaders.set(name, value);
+                }
+                candidates.push({ url: assetUrl, headers: assetHeaders });
+            }
+        }
+    }
+    candidates.push({ url: entry.url, headers: originHeaders });
+
     let originResponse: Response;
     try {
-        originResponse = await fetch(entry.url, {
-            method: method,
-            headers: originHeaders,
-            redirect: "follow",
-            cf: {
-                cacheEverything: true,
-                cacheTtl: ttl,
-                cacheTtlByStatus: { "200-299": ttl, "300-399": -1, "400-599": -1 }
-            }
-        } as any);
+        const result = await fetchOrigin(candidates);
+        if (!result) {
+            throw new Error("所有候选源地址均不可用");
+        }
+        originResponse = result;
     } catch (error) {
         const message = error && (error as any).message ? (error as any).message : String(error);
         return new Response("Upstream fetch failed: " + message, {
