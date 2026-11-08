@@ -3,18 +3,21 @@ import { FileList } from "vuepress-theme-flist";
 
 export default defineUserConfig({
   lang: "zh-CN",
-  title: "Bilup下载中心",
-  description: "Bilup客户端官方下载中心",
+  title: "DLGrass",
+  description: "我的文件列表",
 
-  theme: FileList([
-    {
-      mountPath: "/BilupDesktop",
-      analysis: githubReleasesFilesAnalysis({
-        user: "Bilup",
-        repository: "desktop",
-      }),
-      hideReadme: true,
-      downProxy: cloudflarePagesDownProxy(),
-    },
-  ]),
+  theme: FileList({
+    logo: "/Logo.svg",
+    fileList: [
+      {
+        mountPath: "/BilupDesktop",
+        analysis: githubReleasesFilesAnalysis({
+          user: "Bilup",
+          repository: "desktop",
+        }),
+        hideReadme: true,
+        downProxy: cloudflarePagesDownProxy(),
+      },
+    ],
+  }),
 });
