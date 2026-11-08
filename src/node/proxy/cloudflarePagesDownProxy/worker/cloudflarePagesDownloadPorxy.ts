@@ -67,6 +67,47 @@ export function findProxyEntry(pathname: string, proxyConfig: { [key: string]: P
     return undefined;
 }
 
+/** KV 中存放代理条目的 key（所有条目合并为一份 JSON，避免逐条写入） */
+export const KV_TABLE_KEY = "proxy-table";
+
+/** KV 存储接口（只声明用到的部分，便于在无 KV 绑定的环境复用同一份核心逻辑） */
+export interface KVStore {
+    get(key: string, type?: string): Promise<unknown>;
+}
+
+/**
+ * 从 KV 中加载代理表。
+ *
+ * 这是可选能力：未绑定 KV 时（当前 Pages 部署即为此情形）直接使用构建期内联的静态表，
+ * 行为与改造前完全一致。绑定 KV 后，代理表以 KV 中的数据为最新，
+ * 新增 release 时只需更新 KV，无需重新部署（重新部署会使边缘缓存全部失效）。
+ * KV 不可用或数据损坏时回退到静态表，保证服务不中断。
+ */
+export async function loadProxyConfigFromKV(
+    kv: KVStore | undefined,
+    fallback: { [key: string]: ProxyEntry }
+): Promise<{ [key: string]: ProxyEntry }> {
+    if (!kv) return fallback;
+    try {
+        const raw = await kv.get(KV_TABLE_KEY, "text");
+        if (typeof raw !== "string" || raw.length === 0) return fallback;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return fallback;
+        // 合并：KV 为最新数据，内联表作为兜底（KV 中缺失的条目仍可解析）
+        const merged: { [key: string]: ProxyEntry } = {};
+        Object.keys(fallback).forEach(function (k) { merged[k] = fallback[k]; });
+        Object.keys(parsed).forEach(function (k) {
+            const entry = parsed[k];
+            if (entry && typeof entry.url === "string" && entry.url.length > 0) {
+                merged[k] = entry as ProxyEntry;
+            }
+        });
+        return merged;
+    } catch (error) {
+        return fallback;
+    }
+}
+
 /** 判断内容是否应当内联预览（音视频、图片、PDF） */
 export function isPreviewable(type?: string, name?: string): boolean {
     const t = (type || "").toLowerCase();
@@ -112,10 +153,12 @@ export function detectClientFamily(request: Request): { family: string; ip: stri
  * 下载代理主处理函数。
  *
  * @param request      客户端请求
- * @param proxyConfig  路径片段 -> 代理条目 的映射
+ * @param proxyConfig  路径片段 -> 代理条目 的映射（构建期内联的静态表）
  * @param options      行为配置
+ * @param kv           可选的 KV 存储。不传时使用 proxyConfig；
+ *                     传入时以 KV 中的代理表为最新，KV 不可用则回退到 proxyConfig
  */
-export async function downloadProxy(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions): Promise<Response> {
+export async function downloadProxy(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore): Promise<Response> {
     const opt: ProxyOptions = options || {};
     const url = new URL(request.url);
     const method = (request.method || "GET").toUpperCase();
@@ -161,7 +204,9 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         });
     }
 
-    const entry = findProxyEntry(url.pathname, proxyConfig);
+    // 代理表优先取自 KV（可动态更新），不可用时回退到构建期内联的静态表
+    const resolvedConfig = await loadProxyConfigFromKV(kv, proxyConfig);
+    const entry = findProxyEntry(url.pathname, resolvedConfig);
     if (!entry || !entry.url) {
         return new Response("Not Found", {
             status: 404,

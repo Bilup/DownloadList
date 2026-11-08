@@ -4,3 +4,4 @@ node_modules
 .wrangler
 .vercel
 netlify
+accelerator/dist

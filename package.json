@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vuepress dev",
-    "build": "vuepress build"
+    "build": "vuepress build",
+    "deploy:accelerator": "node scripts/deploy-accelerator.mjs"
   },
   "keywords": [],
   "author": "",
