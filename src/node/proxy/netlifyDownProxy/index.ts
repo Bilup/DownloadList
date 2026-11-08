@@ -23,6 +23,16 @@ function sourceKey(sourceUrl: string): string {
     return createHash("sha1").update(sourceUrl).digest("hex").slice(0, 16);
 }
 
+/** 旧版 32 位 hashCode，作为历史链接的别名 */
+function legacyHashCode(sourceUrl: string): string {
+    let hash = 0;
+    for (let i = 0; i < sourceUrl.length; i++) {
+        hash = ((hash << 5) - hash) + sourceUrl.charCodeAt(i);
+        hash |= 0;
+    }
+    return String(hash);
+}
+
 async function netlifyReleaseConfigurationFile(destPath: string) {
     mkdirSync("./.netlify/edge-functions/server", { recursive: true });
     const entry = resolveWorkerEntry(import.meta.url, "worker/entry.ts");
@@ -72,11 +82,13 @@ onExtendsBundlerOptions(async (options, app) => {
 
 async function netlifyDownProxyInner(sourceUrl: string, fileName: string, contentType?: string): Promise<string> {
     const key = sourceKey(sourceUrl);
-    proxyConfig[key] = {
-        url: sourceUrl,
-        name: fileName,
-        type: contentType
-    };
+    const entry: ProxyEntry = { url: sourceUrl, name: fileName, type: contentType };
+    proxyConfig[key] = entry;
+    // 登记旧版 hashCode 别名，保证历史链接继续可用
+    const legacyKey = legacyHashCode(sourceUrl);
+    if (!Object.prototype.hasOwnProperty.call(proxyConfig, legacyKey)) {
+        proxyConfig[legacyKey] = entry;
+    }
     return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName);
 }
 

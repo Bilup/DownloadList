@@ -53,6 +53,22 @@ function sourceKey(sourceUrl: string): string {
     return createHash("sha1").update(sourceUrl).digest("hex").slice(0, 16);
 }
 
+/**
+ * 旧版使用的 32 位 hashCode。
+ * 保留它是为了让改造前已经分发出去的下载链接在改造后依然可用：
+ * 旧链接形如 /down/<随机前缀>/<hashCode>/<文件名>，
+ * 由于 Worker 侧按“逐段匹配”查找代理表，
+ * 只要把旧的 hashCode 也登记为别名即可继续命中。
+ */
+function legacyHashCode(sourceUrl: string): string {
+    let hash = 0;
+    for (let i = 0; i < sourceUrl.length; i++) {
+        hash = ((hash << 5) - hash) + sourceUrl.charCodeAt(i);
+        hash |= 0;
+    }
+    return String(hash);
+}
+
 function getDownProxyRoutes() {
     return {
         "version": 1,
@@ -96,11 +112,17 @@ onExtendsBundlerOptions(async (options, app) => {
 
 async function cloudflarePagesDownProxyInner(sourceUrl: string, fileName: string, contentType?: string): Promise<string> {
     const key = sourceKey(sourceUrl);
-    proxyConfig[key] = {
+    const entry: ProxyEntry = {
         url: sourceUrl,
         name: fileName,
         type: contentType
     };
+    proxyConfig[key] = entry;
+    // 登记旧版 hashCode 别名，保证历史链接继续可用
+    const legacyKey = legacyHashCode(sourceUrl);
+    if (!Object.prototype.hasOwnProperty.call(proxyConfig, legacyKey)) {
+        proxyConfig[legacyKey] = entry;
+    }
     return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName);
 }
 
