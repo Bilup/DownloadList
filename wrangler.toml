@@ -16,8 +16,19 @@
 #   Cloudflare Pages 的 pages.dev 域名默认同时提供 A 与 AAAA 记录，
 #   站点本身即为 IPv4/IPv6 双栈访问，无需额外 DNS 配置。
 #   源站侧的双栈能力由 Cloudflare 网络自身的 IPv4/IPv6 回源策略保证。
+#
+# KV 绑定：
+#   代理表以 KV 中的数据为最新，构建期内联的静态表仅作兜底。
+#   这样新增 release 时只需更新 KV（60 秒内全网生效），
+#   无需重新构建部署站点 —— 重新部署会清空边缘缓存，导致下载速度骤降。
+#   未绑定或 KV 不可用时自动回退到静态表，行为与之前完全一致。
 
 name = "bilup-download-list"
 compatibility_date = "2026-11-08"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = ".vuepress/dist"
+
+[[kv_namespaces]]
+binding = "PROXY_KV"
+id = "cf58fc8ae236409baf4dbc793424797e"
+

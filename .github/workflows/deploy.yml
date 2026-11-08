@@ -136,6 +136,42 @@ jobs:
           path: .vuepress/proxy-table.json
           if-no-files-found: ignore
 
+  # 同步代理表到 KV
+  # Pages 的 _worker.js 与独立加速 Worker 都以 KV 中的代理表为最新数据。
+  # 同步 KV 不会触发重新部署，因此边缘缓存得以保留，下载速度不受影响。
+  sync-kv:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download proxy table
+        uses: actions/download-artifact@v4
+        with:
+          name: proxy-table
+          path: .vuepress
+
+      - name: Sync proxy table to KV
+        # 未配置 Cloudflare 凭据时跳过，避免因缺少密钥导致流水线失败。
+        # 注意：GitHub 的表达式求值器不允许在 if 条件中引用 secrets 上下文
+        # （无论 job 级还是 step 级，都会导致工作流校验失败），
+        # 因此这里通过 env 把密钥传入，再由脚本自行判断。
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "未配置 CLOUDFLARE_API_TOKEN，跳过代理表同步"
+            exit 0
+          fi
+          node scripts/sync-proxy-table.mjs
+
   deploy:
     needs: build
     runs-on: ubuntu-latest
