@@ -21,8 +21,3 @@ name = "bilup-download-list"
 compatibility_date = "2026-11-08"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = ".vuepress/dist"
-
-# 代理表较大，_worker.js 需要单独较高的压缩阈值，
-# 避免构建时对 Worker 产物做过重的压缩而拖慢构建。
-[build]
-command = "npm run build"
