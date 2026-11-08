@@ -1,0 +1,132 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+分支: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect package manager and project dir
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            ROOT="."
+          elif [ -f "frontend/package.json" ]; then
+            ROOT="frontend"
+          elif [ -f "app/package.json" ]; then
+            ROOT="app"
+          elif [ -f "web/package.json" ]; then
+            ROOT="web"
+          else
+            ROOT=$(find . -maxdepth 3 -name package.json -not -path "*/node_modules/*" | head -n1 | xargs -r dirname)
+            [ -z "$ROOT" ] && ROOT="."
+          fi
+          echo "root=$ROOT" >> $GITHUB_OUTPUT
+
+          if [ -f "$ROOT/pnpm-lock.yaml" ]; then
+            PM="pnpm"; LOCK="$ROOT/pnpm-lock.yaml"
+          elif [ -f "$ROOT/yarn.lock" ]; then
+            PM="yarn"; LOCK="$ROOT/yarn.lock"
+          elif [ -f "$ROOT/package-lock.json" ]; then
+            PM="npm"; LOCK="$ROOT/package-lock.json"
+          elif [ -f "$ROOT/package.json" ]; then
+            PM="npm"; LOCK=""   # 有 package.json 但无锁文件
+          else
+            PM="none"; LOCK=""
+          fi
+          echo "pm=$PM" >> $GITHUB_OUTPUT
+          echo "lock=$LOCK" >> $GITHUB_OUTPUT
+          echo "Detected: root=$ROOT, pm=$PM, lock=$LOCK"
+
+      - name: Setup pnpm
+        if: steps.detect.outputs.pm == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node (with cache)
+        if: steps.detect.outputs.lock != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: ${{ steps.detect.outputs.pm }}
+          cache-dependency-path: ${{ steps.detect.outputs.lock }}
+
+      - name: Setup Node (no cache)
+        if: steps.detect.outputs.lock == ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          case "${{ steps.detect.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile || pnpm install ;;
+            yarn) yarn install --frozen-lockfile || yarn install ;;
+            npm)
+              if [ -f package-lock.json ]; then npm ci; else npm install; fi
+              ;;
+            *)
+              echo "No package.json found, skip install";;
+          esac
+
+      - name: Build
+        id: build
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          if [ ! -f package.json ]; then
+            echo "No build step, using root as output"
+            echo "output=${{ steps.detect.outputs.root }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if node -e "const s=require('./package.json').scripts||{}; process.exit(s.build?0:1)"; then
+            npm run build
+          elif node -e "const s=require('./package.json').scripts||{}; process.exit(s.docs:build?0:1)"; then
+            npm run docs:build
+          else
+            echo "No build script found"; exit 1
+          fi
+
+          for d in dist out build public _site docs/.vitepress/dist .vitepress/dist; do
+            if [ -d "$d" ]; then
+              echo "output=${{ steps.detect.outputs.root }}/$d" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+          echo "output=${{ steps.detect.outputs.root }}" >> $GITHUB_OUTPUT
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ steps.build.outputs.output }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
