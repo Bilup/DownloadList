@@ -20,6 +20,9 @@ export default defineUserConfig({
       footer, .footer, .vp-footer, [class*="footer"], [class*="Footer"] {
         display: none !important;
       }
+      .page-layouts, .main-box, .vp-page {
+        padding-bottom: 4rem !important; 
+      }
     `]
   ],
   shouldPrefetch: true,
