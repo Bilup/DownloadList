@@ -1,0 +1,11 @@
+{
+  "analysis": {
+    "type": "githubReleasesFilesAnalysis",
+    "options": {
+      "user": "Bilup",
+      "repository": "desktop",
+      "authorizationToken": {"$env": "githubToken"}
+    }
+  },
+  "downProxy": { "type": "cloudflarePagesDownProxy" }
+}
