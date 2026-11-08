@@ -2,20 +2,14 @@ import { abFolders, addFileToFileTree, Folder, joinFile } from "../../base/files
 import { Analysis } from "../../base/AllAnalysis.js";
 
 
-/**
- * 代表一个github仓库
- * */
 export interface GithubRepository {
     user: string
     repository: string,
     authorizationToken?: string,
-    per_page?: number, // 页面大小
-    page?: number // 第几页
+    per_page?: number,
+    page?: number
 }
 
-/**
- * 从GitHub仓库的releases中解析文件信息
- * */
 async function githubReleasesFileTree(config: GithubRepository): Promise<Folder> {
     const fileTree: Folder = { children: [], name: "githubReleasesRoot" };
     let tagInfo
@@ -56,13 +50,15 @@ async function githubReleasesFileTree(config: GithubRepository): Promise<Folder>
     for (const { tag_name, name, body, published_at, assets } of jsonData) {
         const tagFolder: Folder = {
             title: name,
-            content: body,
+            content: "", 
             children: [],
             updateTime: new Date(published_at).getTime(),
             size: 0,
             name: "githubReleasesTagRoot"
         };
         for (const { browser_download_url, size, name, updated_at, content_type } of assets) {
+            if (name.includes("Source code")) continue; 
+            
             joinFile(tagFolder, {
                 downloadUrl: browser_download_url,
                 updateTime: new Date(updated_at).getTime(),
@@ -89,11 +85,6 @@ async function githubReleasesFileTree(config: GithubRepository): Promise<Folder>
     }
     return fileTree;
 }
-
-
-/**
- * 从GitHub仓库的releases中解析文件信息
- * */
 export function githubReleasesFilesAnalysis(config: GithubRepository): Analysis {
     return () => githubReleasesFileTree(config);
 }
