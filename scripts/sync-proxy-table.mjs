@@ -1,14 +1,14 @@
 /**
  * 把代理表同步到 KV。
  *
- * Pages 的 `_worker.js` 与独立加速器 Worker 都以 KV 中的代理表为最新数据，
- * 构建期内联的静态表仅作兜底。因此新增 release 时：
+ * Pages 的 `_worker.js` 以 KV 中的代理表为最新数据，构建期内联的静态表仅作兜底。
+ * 因此新增 release 时：
  *
  *   1. 跑一次构建，产出 .vuepress/proxy-table.json（代理表副本）
  *   2. 执行本脚本把该表写入 KV
- *   3. KV 边缘缓存在 60 秒内全网生效，无需重新部署
+ *   3. KV 边缘缓存在 60 秒内全网生效
  *
- * 第 3 步是关键：重新部署会清空边缘缓存，导致所有下载回源、速度骤降。
+ * 同步 KV 不会触发重新部署，因此边缘缓存得以保留，下载速度不受影响。
  *
  * 用法：
  *   CLOUDFLARE_API_TOKEN=<token> CLOUDFLARE_ACCOUNT_ID=<id> \
@@ -22,7 +22,7 @@ import {fileURLToPath} from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
 
-const KV_NAMESPACE_TITLE = "bilup-download-accelerator";
+const KV_NAMESPACE_TITLE = "bilup-download-proxy";
 const KV_TABLE_KEY = "proxy-table";
 const API = "https://api.cloudflare.com/client/v4";
 
@@ -47,6 +47,10 @@ async function cf(path, options = {}) {
         }
     });
     const text = await res.text();
+    if (!text) return null;
+    // KV 的 values 端点返回 application/octet-stream 纯文本，不是 JSON 包装
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.indexOf("application/json") < 0) return text;
     let json;
     try {
         json = JSON.parse(text);

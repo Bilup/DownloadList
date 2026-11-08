@@ -30,5 +30,5 @@ pages_build_output_dir = ".vuepress/dist"
 
 [[kv_namespaces]]
 binding = "PROXY_KV"
-id = "cf58fc8ae236409baf4dbc793424797e"
+id = "0f2a1024b3904992ac12c27b184e3617"
 

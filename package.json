@@ -7,7 +7,6 @@
   "scripts": {
     "dev": "vuepress dev",
     "build": "vuepress build",
-    "deploy:accelerator": "node scripts/deploy-accelerator.mjs",
     "sync:proxy-table": "node scripts/sync-proxy-table.mjs"
   },
   "keywords": [],
