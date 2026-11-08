@@ -214,6 +214,17 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         responseHeaders.set(key, value);
     });
 
+    // 回源缓存状态（HIT 表示本次未回源，直接由 Cloudflare 边缘缓存提供）
+    const originCacheStatus = originResponse.headers.get("cf-cache-status");
+    if (originCacheStatus) {
+        responseHeaders.set("x-proxy-cache-status", originCacheStatus);
+    }
+    // 边缘回源耗时信息，便于观测加速效果
+    const originAge = originResponse.headers.get("age");
+    if (originAge) {
+        responseHeaders.set("x-proxy-origin-age", originAge);
+    }
+
     // 内容处置：可预览类型内联，其余作为附件下载
     const inline = isPreviewable(entry.type, entry.name);
     const disposition = buildContentDisposition(entry.name, inline);
