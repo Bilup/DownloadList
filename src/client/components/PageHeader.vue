@@ -9,7 +9,7 @@ const siteData = useSiteData()
 <template>
   <header class="header">
     <RouterLink class="left" to="/">
-      <img src="/logo.png" alt="logo" class="logo" />
+      <img src="/Logo.svg" alt="logo" class="logo" />
       <div class="logo-title">{{siteData.title}}</div>
     </RouterLink>
     <div class="right">
