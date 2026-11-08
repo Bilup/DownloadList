@@ -331,61 +331,6 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         });
     }
 
-    /**
-     * 缓存策略对照实验端点（仅用于验证，不参与正常下载路径）。
-     *
-     * 依次用多种方式请求同一个源站，对比各自的 cf-cache-status，
-     * 用于确定哪种缓存键写法能稳定命中边缘缓存。
-     */
-    if (url.pathname.split("/").filter(Boolean).indexOf("_probe") >= 0
-        && url.pathname.indexOf("/down/") === 0) {
-        const targetKey = url.pathname.split("/").filter(Boolean)[2] || "";
-        const entry = findProxyEntry("/" + targetKey, proxyConfig);
-        if (!entry || !entry.url) {
-            return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
-        }
-        const results: Array<Record<string, unknown>> = [];
-        const probe = async (label: string, target: string, key: string | undefined, headers: Headers) => {
-            try {
-                const r = await fetch(target, {
-                    method: "GET",
-                    headers: headers,
-                    redirect: "follow",
-                    cf: buildCacheOptions(key || target)
-                } as any);
-                results.push({
-                    strategy: label,
-                    status: r.status,
-                    cfCacheStatus: r.headers.get("cf-cache-status") || null,
-                    age: r.headers.get("age") || null,
-                    cacheKey: key || null
-                });
-                try { await r.body?.cancel(); } catch (e) { /* 忽略 */ }
-            } catch (error) {
-                results.push({ strategy: label, error: String(error).slice(0, 120) });
-            }
-        };
-        const plain = new Headers();
-        plain.set("accept-encoding", "identity");
-        plain.set("user-agent", "bilup-cache-probe");
-
-        // 策略 1：直接用原始 URL，不带 cacheKey
-        await probe("origin-plain", entry.url, undefined, new Headers(plain));
-        // 策略 2：原始 URL + cacheKey=path+query
-        await probe("origin-cachekey", entry.url, toStableCacheKey(entry.url), new Headers(plain));
-        // 策略 3：签名 URL（跟随重定向）+ cacheKey=path+query
-        if (entry.assetId) {
-            const signed = await resolveSignedUrl(entry.assetId, entry.url, plain);
-            if (signed) {
-                await probe("signed-cachekey", signed, toStableCacheKey(entry.url), new Headers(plain));
-                await probe("signed-plain", signed, undefined, new Headers(plain));
-            }
-        }
-        return new Response(JSON.stringify({ targetKey, results }, null, 2), {
-            headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
-        });
-    }
-
     // 代理表优先取自 KV（可动态更新），不可用时回退到构建期内联的静态表
     const resolvedConfig = await loadProxyConfigFromKV(kv, proxyConfig);
     const entry = findProxyEntry(url.pathname, resolvedConfig);
@@ -540,6 +485,60 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         } catch (error) {
             return undefined;
         }
+    }
+
+    /**
+     * 缓存策略对照实验端点（仅用于验证，不参与正常下载路径）。
+     *
+     * 依次用多种方式请求同一个源站，对比各自的 cf-cache-status，
+     * 用于确定哪种缓存键写法能稳定命中边缘缓存。
+     */
+    if (url.pathname.split("/").filter(Boolean).indexOf("_probe") >= 0
+        && url.pathname.indexOf("/down/") === 0) {
+        const targetKey = url.pathname.split("/").filter(Boolean)[2] || "";
+        const probeEntry = findProxyEntry("/" + targetKey, proxyConfig);
+        if (!probeEntry || !probeEntry.url) {
+            return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
+        }
+        const results: Array<Record<string, unknown>> = [];
+        const probe = async (label: string, target: string, key: string | undefined, headers: Headers) => {
+            try {
+                const r = await fetch(target, {
+                    method: "GET",
+                    headers: headers,
+                    redirect: "follow",
+                    cf: buildCacheOptions(key || target)
+                } as any);
+                results.push({
+                    strategy: label,
+                    status: r.status,
+                    cfCacheStatus: r.headers.get("cf-cache-status") || null,
+                    age: r.headers.get("age") || null
+                });
+                try { await r.body?.cancel(); } catch (e) { /* 忽略 */ }
+            } catch (error) {
+                results.push({ strategy: label, error: String(error).slice(0, 120) });
+            }
+        };
+        const plain = new Headers();
+        plain.set("accept-encoding", "identity");
+        plain.set("user-agent", "bilup-cache-probe");
+
+        // 策略 1：原始 URL，不带 cacheKey
+        await probe("origin-plain", probeEntry.url, undefined, new Headers(plain));
+        // 策略 2：原始 URL + cacheKey=path+query
+        await probe("origin-cachekey", probeEntry.url, toStableCacheKey(probeEntry.url), new Headers(plain));
+        // 策略 3/4：签名 URL，分别带与不带 cacheKey
+        if (probeEntry.assetId) {
+            const signed = await resolveSignedUrl(probeEntry.assetId, probeEntry.url, plain);
+            if (signed) {
+                await probe("signed-cachekey", signed, toStableCacheKey(probeEntry.url), new Headers(plain));
+                await probe("signed-plain", signed, undefined, new Headers(plain));
+            }
+        }
+        return new Response(JSON.stringify({ targetKey, results }, null, 2), {
+            headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
+        });
     }
 
     // 组装候选源地址：签名后的 asset 地址优先，原始 URL 兜底
