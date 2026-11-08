@@ -331,6 +331,61 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         });
     }
 
+    /**
+     * 缓存策略对照实验端点（仅用于验证，不参与正常下载路径）。
+     *
+     * 依次用多种方式请求同一个源站，对比各自的 cf-cache-status，
+     * 用于确定哪种缓存键写法能稳定命中边缘缓存。
+     */
+    if (url.pathname.split("/").filter(Boolean).indexOf("_probe") >= 0
+        && url.pathname.indexOf("/down/") === 0) {
+        const targetKey = url.pathname.split("/").filter(Boolean)[2] || "";
+        const entry = findProxyEntry("/" + targetKey, proxyConfig);
+        if (!entry || !entry.url) {
+            return new Response("Not Found", { status: 404, headers: { "cache-control": "no-store" } });
+        }
+        const results: Array<Record<string, unknown>> = [];
+        const probe = async (label: string, target: string, key: string | undefined, headers: Headers) => {
+            try {
+                const r = await fetch(target, {
+                    method: "GET",
+                    headers: headers,
+                    redirect: "follow",
+                    cf: buildCacheOptions(key || target)
+                } as any);
+                results.push({
+                    strategy: label,
+                    status: r.status,
+                    cfCacheStatus: r.headers.get("cf-cache-status") || null,
+                    age: r.headers.get("age") || null,
+                    cacheKey: key || null
+                });
+                try { await r.body?.cancel(); } catch (e) { /* 忽略 */ }
+            } catch (error) {
+                results.push({ strategy: label, error: String(error).slice(0, 120) });
+            }
+        };
+        const plain = new Headers();
+        plain.set("accept-encoding", "identity");
+        plain.set("user-agent", "bilup-cache-probe");
+
+        // 策略 1：直接用原始 URL，不带 cacheKey
+        await probe("origin-plain", entry.url, undefined, new Headers(plain));
+        // 策略 2：原始 URL + cacheKey=path+query
+        await probe("origin-cachekey", entry.url, toStableCacheKey(entry.url), new Headers(plain));
+        // 策略 3：签名 URL（跟随重定向）+ cacheKey=path+query
+        if (entry.assetId) {
+            const signed = await resolveSignedUrl(entry.assetId, entry.url, plain);
+            if (signed) {
+                await probe("signed-cachekey", signed, toStableCacheKey(entry.url), new Headers(plain));
+                await probe("signed-plain", signed, undefined, new Headers(plain));
+            }
+        }
+        return new Response(JSON.stringify({ targetKey, results }, null, 2), {
+            headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
+        });
+    }
+
     // 代理表优先取自 KV（可动态更新），不可用时回退到构建期内联的静态表
     const resolvedConfig = await loadProxyConfigFromKV(kv, proxyConfig);
     const entry = findProxyEntry(url.pathname, resolvedConfig);
@@ -364,6 +419,10 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
      * cacheKey：把子请求的缓存键固定为「稳定的源站 URL」。
      * 这是本次改造的核心 —— asset API 的 302 目标带时效签名，
      * 每次都不同，不固定缓存键就永远 MISS。
+     *
+     * 注意：cacheKey 替换的是「路径与查询串」部分，
+     * 因此传入的是源站 URL 的 path+query，而非完整 URL，
+     * 避免把 https:// 前缀也计入键中。
      */
     function buildCacheOptions(stableKey: string): any {
         return {
@@ -372,6 +431,18 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
             cacheTtlByStatus: { "200-299": ttl, "300-399": -1, "400-599": -1 },
             cacheKey: stableKey
         };
+    }
+
+    /**
+     * 从源站 URL 中提取稳定的缓存键成分（path + query，去掉 origin）。
+     */
+    function toStableCacheKey(sourceUrl: string): string {
+        try {
+            const parsed = new URL(sourceUrl);
+            return parsed.pathname + parsed.search;
+        } catch (error) {
+            return sourceUrl;
+        }
     }
 
     /**
@@ -472,17 +543,18 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     }
 
     // 组装候选源地址：签名后的 asset 地址优先，原始 URL 兜底
+    const stableCacheKey = toStableCacheKey(entry.url);
     const candidates: Array<{ url: string; headers: Headers; cacheKey?: string }> = [];
     if (entry.assetId) {
         const signed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
         if (signed) {
             const signedHeaders = new Headers(originHeaders);
-            // 对签名 URL 的请求，缓存键固定为原始源站 URL。
+            // 对签名 URL 的请求，缓存键固定为原始源站 URL 的 path+query。
             // 签名会变，但缓存键不变，边缘缓存才能真正命中。
-            candidates.push({ url: signed, headers: signedHeaders, cacheKey: entry.url });
+            candidates.push({ url: signed, headers: signedHeaders, cacheKey: stableCacheKey });
         }
     }
-    candidates.push({ url: entry.url, headers: originHeaders, cacheKey: entry.url });
+    candidates.push({ url: entry.url, headers: originHeaders, cacheKey: stableCacheKey });
 
     let originResponse: Response;
     try {
@@ -505,7 +577,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
             const refreshed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
             if (refreshed) {
                 const retry = await fetchOrigin([
-                    { url: refreshed, headers: new Headers(originHeaders), cacheKey: entry.url }
+                    { url: refreshed, headers: new Headers(originHeaders), cacheKey: stableCacheKey }
                 ]);
                 if (retry) {
                     try {
