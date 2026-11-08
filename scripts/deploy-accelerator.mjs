@@ -157,15 +157,38 @@ async function deployWorker(accountId, source, namespaceId) {
  *
  * 通过 API 直传脚本不会自动创建 workers.dev 路由，
  * 未启用时请求会命中 "error code: 1042"（找不到 Worker）。
+ *
+ * 注意：
+ *   1. 此端点只接受 POST，PUT/PATCH 会返回 405。
+ *   2. 开启该路由的权限高于普通 User API Token（会返回 405），
+ *      此时只要路由已启用即可，不视为失败。
  */
 async function enableWorkersDev(accountId, enabled = true) {
-    // 注意：此端点只接受 POST，PUT/PATCH 会返回 405
-    const result = await cf(`/accounts/${accountId}/workers/scripts/${WORKER_NAME}/subdomain`, {
-        method: "POST",
-        body: JSON.stringify({enabled, previews_enabled: false})
-    });
-    log(`workers.dev 路由: ${result.enabled ? "已启用" : "已禁用"}`);
-    return result;
+    let current = null;
+    try {
+        current = await cf(`/accounts/${accountId}/workers/scripts/${WORKER_NAME}/subdomain`);
+    } catch (error) {
+        current = null;
+    }
+    if (current && current.enabled === enabled) {
+        log(`workers.dev 路由已是 ${enabled ? "启用" : "禁用"} 状态，跳过`);
+        return current;
+    }
+    try {
+        const result = await cf(`/accounts/${accountId}/workers/scripts/${WORKER_NAME}/subdomain`, {
+            method: "POST",
+            body: JSON.stringify({enabled, previews_enabled: false})
+        });
+        log(`workers.dev 路由: ${result.enabled ? "已启用" : "已禁用"}`);
+        return result;
+    } catch (error) {
+        const message = error && error.message ? error.message : String(error);
+        if (message.indexOf("405") >= 0) {
+            log("当前凭据无权修改 workers.dev 路由（405），跳过；请在控制台确认路由已启用");
+            return null;
+        }
+        throw error;
+    }
 }
 
 async function main() {
