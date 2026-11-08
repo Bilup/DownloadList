@@ -41,7 +41,7 @@ onExtendsBundlerOptions(async (options,app)=>{
         for (const proxyConfigKey in proxyConfig) {
             const proxyConfigValue = proxyConfig[proxyConfigKey];
             proxy[proxyConfigKey] = {
-                target: new 网站(proxyConfigValue).toString(),
+                target : new URL ( proxyConfigValue ) . toString ( ) ,
                 changeOrigin: true,
                 rewrite: () => "",
                 followRedirects: true,
