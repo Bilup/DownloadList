@@ -22,8 +22,8 @@ export default defineUserConfig({
         authorizationToken: process.env.githubToken,
         per_page: 10,
       }),
-      hideReadme: true, // 隐藏 README
-      downProxy: cloudflarePagesDownProxy(), // 代理正常使用
+      hideReadme: true,
+      downProxy: cloudflarePagesDownProxy(),
     },
   ])
 })
