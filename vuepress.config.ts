@@ -9,20 +9,30 @@ export default defineUserConfig({
   pagePatterns: [],
   lang: 'zh-CN',
   public: `.vuepress/public`,
-  title: 'Bilup Desktop',
+  title: 'Bilup',
   description: 'Bilup - 更好的Turbowarp',
-  head: [['link', { rel: 'icon', href: '/Logo.svg' }]],
+  head: [
+    ['link', { rel: 'icon', href: '/Logo.svg' }],
+    ['style', {}, `
+      :root {
+        --logo-color: #7AB2C5 !important;
+      }
+    `]
+  ],
   shouldPrefetch: true,
-  theme: FileList([
-    {
-      mountPath: "/",
-      analysis: githubReleasesFilesAnalysis({
-        user: "Bilup",
-        repository: "desktop",
-        authorizationToken: process.env.githubToken,
-        per_page: 10,
-      }),
-      downProxy: cloudflarePagesDownProxy(),
-    },
-  ])
+  theme: FileList({
+    footer: "", 
+    fileList: [
+      {
+        mountPath: "/",
+        analysis: githubReleasesFilesAnalysis({
+          user: "Bilup",
+          repository: "desktop",
+          authorizationToken: process.env.githubToken,
+          per_page: 10,
+        }),
+        downProxy: cloudflarePagesDownProxy(),
+      },
+    ]
+  })
 })
