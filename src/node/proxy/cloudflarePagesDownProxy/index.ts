@@ -82,8 +82,8 @@ async function cloudflarePagesReleaseConfigurationFile(destPath: string) {
     const workerSource = await bundleProxyWorker(entry, proxyConfig, proxyOptions);
     writeFileSync(path.join(destPath, "_worker.js"), workerSource);
     writeFileSync(path.join(destPath, "_routes.json"), JSON.stringify(getDownProxyRoutes()));
-    // 导出代理表副本到构建目录之外，供外部工具（如独立的加速 Worker、运维脚本）
-    // 读取或同步到 KV。写到 dist 之外，避免随站点一起公开暴露内部映射。
+    // 导出代理表副本到构建目录之外，供 CI 同步到 KV。
+    // 写到 dist 之外，避免随站点一起公开暴露内部映射。
     writeFileSync(path.join(destPath, "..", "proxy-table.json"), JSON.stringify(proxyConfig));
 }
 

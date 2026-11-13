@@ -104,6 +104,8 @@ async function main() {
     // 写入 GitHub 令牌，供代理用 asset API 回源
     const ghToken = process.env.GITHUB_TOKEN;
     if (ghToken && ghToken.length > 0) {
+        // 先验令牌有效性，失效则直接失败，避免把坏令牌写进 KV
+        await checkGitHubToken(ghToken);
         await cf(`/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${KV_TOKEN_KEY}`, {
             method: "PUT",
             body: ghToken
@@ -111,6 +113,31 @@ async function main() {
         log(`GitHub 令牌已写入 KV (${KV_TOKEN_KEY})`);
     } else {
         log(`未提供 GITHUB_TOKEN，跳过令牌写入（代理将回退到原始 URL，冷缓存可能 504）`);
+    }
+}
+
+/**
+ * 检查 GitHub 令牌是否仍然有效。
+ *
+ * 令牌失效时，代理的 asset API 回源会 401/403，
+ * 冷缓存的新版本首次下载就会失败，且问题隐蔽（缓存命中时一切正常）。
+ * 因此在同步前先验一次，失效则让流水线明确失败。
+ */
+async function checkGitHubToken(token) {
+    const res = await fetch("https://api.github.com/rate_limit", {
+        headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+    });
+    if (!res.ok) {
+        throw new Error(`GitHub 令牌校验失败 (${res.status} ${res.statusText})，请更新 GITHUB_TOKEN`);
+    }
+    const json = await res.json();
+    const core = json && json.resources && json.resources.core;
+    if (core) {
+        log(`GitHub 令牌有效，API 配额剩余 ${core.remaining}/${core.limit}`);
     }
 }
 

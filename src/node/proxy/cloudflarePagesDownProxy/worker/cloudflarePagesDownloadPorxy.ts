@@ -103,7 +103,13 @@ export const KV_TABLE_KEY = "proxy-table";
 
 /** KV 存储接口（只声明用到的部分，便于在无 KV 绑定的环境复用同一份核心逻辑） */
 export interface KVStore {
+    /**
+     * 读取 KV 值。
+     *
+     * type 为 "text" 时返回字符串；传入 options 时返回该类型下的解析结果。
+     */
     get(key: string, type?: string): Promise<unknown>;
+    get(key: string, options: { type?: string; cacheTtl?: number }): Promise<unknown>;
 }
 
 /**
@@ -126,7 +132,10 @@ export async function loadProxyConfigFromKV(
     if (cached) return cached;
 
     try {
-        const raw = await kv.get(KV_TABLE_KEY, "text");
+        // cacheTtl 设为 30 秒（KV 允许的最小值），让代理表的更新
+        // 尽快在各地边缘节点生效。KV 本身是最终一致的，
+        // 默认 60 秒会让新版本的下载链接在部分节点短暂 404。
+        const raw = await kv.get(KV_TABLE_KEY, { type: "text", cacheTtl: 30 });
         if (typeof raw !== "string" || raw.length === 0) return fallback;
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== "object") return fallback;
@@ -434,7 +443,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         if (cached) return cached;
         if (!kv) return null;
         try {
-            const raw = await kv.get(KV_TOKEN_KEY, "text");
+            const raw = await kv.get(KV_TOKEN_KEY, { type: "text", cacheTtl: 30 });
             if (typeof raw === "string" && raw.length > 0) {
                 tokenCache = { value: raw, expiresAt: Date.now() + TOKEN_TTL_MS };
                 return raw;

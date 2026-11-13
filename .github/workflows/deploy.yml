@@ -128,7 +128,7 @@ jobs:
         with:
           path: ${{ steps.build.outputs.output }}
 
-      # 代理表副本单独上传，供独立加速 Worker 同步到 KV
+      # 代理表副本单独上传，供同步到 KV
       - name: Upload proxy table
         uses: actions/upload-artifact@v4
         with:
@@ -137,8 +137,10 @@ jobs:
           if-no-files-found: ignore
 
   # 同步代理表到 KV
-  # Pages 的 _worker.js 与独立加速 Worker 都以 KV 中的代理表为最新数据。
-  # 同步 KV 不会触发重新部署，因此边缘缓存得以保留，下载速度不受影响。
+  #
+  # 代理表来自 build 作业的同一份构建产物，与随后部署的站点内容完全一致，
+  # 不会出现「站点已含新版、KV 还是旧版」的快照错位。
+  # 同步 KV 不会触发重新部署，边缘缓存得以保留。
   sync-kv:
     needs: build
     runs-on: ubuntu-latest
@@ -174,13 +176,42 @@ jobs:
           fi
           node scripts/sync-proxy-table.mjs
 
+  # 部署到 Cloudflare Pages
+  #
+  # 由本流水线统一部署，而不是依赖 CF Pages 的 GitHub 集成自动构建：
+  # 后者会在 push 时独立再跑一次构建，于是站点与 KV 代理表分别来自
+  # 两次不同的 GitHub Releases API 快照，新版链接可能点不开（404）。
+  # 统一到这里后，构建 → 同步 KV → 部署站点，全部基于同一份构建产物，
+  # 提交一次即可完成「发布新版 → 站点更新 → 代理生效」的全流程。
   deploy:
-    needs: build
+    needs: [build, sync-kv]
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Download artifact
+        uses: actions/download-pages-artifact@v4
+        with:
+          path: .vuepress/dist
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "未配置 CLOUDFLARE_API_TOKEN，无法部署到 Cloudflare Pages"
+            exit 1
+          fi
+          npx --yes wrangler@4.161.0 pages deploy .vuepress/dist \
+            --project-name=bilup-download-list \
+            --branch=main \
+            --commit-hash="${{ github.sha }}" \
+            --commit-dirty=false \
+            --no-bundle
