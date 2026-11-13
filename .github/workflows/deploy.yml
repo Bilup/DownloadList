@@ -145,7 +145,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Download proxy table
         uses: actions/download-artifact@v4
@@ -197,7 +197,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Download artifact
         uses: actions/download-artifact@v4
