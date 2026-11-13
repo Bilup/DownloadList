@@ -237,6 +237,10 @@ jobs:
           fi
           # Cloudflare API 偶发 503（no healthy upstream），重试若干次。
           # 文件上传是幂等的，重试不会产生重复文件。
+          #
+          # 注意：必须开启 pipefail，否则 `cmd | tee` 的退出码取自 tee（恒为 0），
+          # 会把部署失败误判为成功。
+          set -o pipefail
           for attempt in 1 2 3 4 5; do
             echo "部署尝试 $attempt/5"
             if npx --yes wrangler@4.161.0 pages deploy .vuepress/dist \
@@ -253,4 +257,12 @@ jobs:
           done
           echo "部署重试耗尽"
           exit 1
+
+      - name: Upload deploy log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-log
+          path: /tmp/wrangler.log
+          if-no-files-found: ignore
 
