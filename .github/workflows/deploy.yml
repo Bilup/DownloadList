@@ -210,18 +210,21 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          echo "account_id=${CLOUDFLARE_ACCOUNT_ID}"
-          echo "token_length=${#CLOUDFLARE_API_TOKEN}"
-          echo "--- token 验证 ---"
-          curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/user/tokens/verify" | head -c 400
-          echo
-          echo "--- 账户验证 ---"
-          curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID" | head -c 300
-          echo
-          echo "--- wrangler 版本 ---"
-          npx --yes wrangler@4.161.0 --version
+          {
+            echo "### Cloudflare 凭据诊断"
+            echo ""
+            echo "- account_id: ${CLOUDFLARE_ACCOUNT_ID}"
+            echo "- token 长度: ${#CLOUDFLARE_API_TOKEN}"
+            echo ""
+            echo "#### token 验证"
+            curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/user/tokens/verify" | head -c 400
+            echo ""
+            echo ""
+            echo "#### API 连通性"
+            curl -s -o /dev/null -w "api.cloudflare.com http=%{http_code} time=%{time_total}s\n" --max-time 30 \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Deploy to Cloudflare Pages
         env:
@@ -241,12 +244,13 @@ jobs:
               --branch=main \
               --commit-hash="${{ github.sha }}" \
               --commit-dirty=false \
-              --no-bundle; then
+              --no-bundle 2>&1 | tee /tmp/wrangler.log; then
               echo "部署成功"
               exit 0
             fi
-            echo "第 $attempt 次部署失败，等待后重试"
+            echo "第 $attempt 次部署失败，错误摘要见 job summary"
             sleep $((attempt * 10))
           done
           echo "部署重试耗尽"
           exit 1
+

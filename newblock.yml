@@ -1,0 +1,48 @@
+      - name: Diagnose Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          {
+            echo "### Cloudflare 凭据诊断"
+            echo ""
+            echo "- account_id: ${CLOUDFLARE_ACCOUNT_ID}"
+            echo "- token 长度: ${#CLOUDFLARE_API_TOKEN}"
+            echo ""
+            echo "#### token 验证"
+            curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              "https://api.cloudflare.com/client/v4/user/tokens/verify" | head -c 400
+            echo ""
+            echo ""
+            echo "#### API 连通性"
+            curl -s -o /dev/null -w "api.cloudflare.com http=%{http_code} time=%{time_total}s\n" --max-time 30 \
+              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "未配置 CLOUDFLARE_API_TOKEN，无法部署到 Cloudflare Pages"
+            exit 1
+          fi
+          # Cloudflare API 偶发 503（no healthy upstream），重试若干次。
+          # 文件上传是幂等的，重试不会产生重复文件。
+          for attempt in 1 2 3 4 5; do
+            echo "部署尝试 $attempt/5"
+            if npx --yes wrangler@4.161.0 pages deploy .vuepress/dist \
+              --project-name=bilup-download-list \
+              --branch=main \
+              --commit-hash="${{ github.sha }}" \
+              --commit-dirty=false \
+              --no-bundle 2>&1 | tee /tmp/wrangler.log; then
+              echo "部署成功"
+              exit 0
+            fi
+            echo "第 $attempt 次部署失败，错误摘要见 job summary"
+            sleep $((attempt * 10))
+          done
+          echo "部署重试耗尽"
+          exit 1
