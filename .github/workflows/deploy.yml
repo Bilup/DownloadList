@@ -168,7 +168,17 @@ jobs:
             echo "未配置 CLOUDFLARE_API_TOKEN，跳过代理表同步"
             exit 0
           fi
-          node scripts/sync-proxy-table.mjs
+          # Cloudflare API 偶发 503，重试若干次。
+          for attempt in 1 2 3 4 5; do
+            echo "同步尝试 $attempt/5"
+            if node scripts/sync-proxy-table.mjs; then
+              exit 0
+            fi
+            echo "第 $attempt 次同步失败，等待后重试"
+            sleep $((attempt * 10))
+          done
+          echo "代理表同步重试耗尽"
+          exit 1
 
   # 部署到 Cloudflare Pages
   #
@@ -204,9 +214,21 @@ jobs:
             echo "未配置 CLOUDFLARE_API_TOKEN，无法部署到 Cloudflare Pages"
             exit 1
           fi
-          npx --yes wrangler@4.161.0 pages deploy .vuepress/dist \
-            --project-name=bilup-download-list \
-            --branch=main \
-            --commit-hash="${{ github.sha }}" \
-            --commit-dirty=false \
-            --no-bundle
+          # Cloudflare API 偶发 503（no healthy upstream），重试若干次。
+          # 文件上传是幂等的，重试不会产生重复文件。
+          for attempt in 1 2 3 4 5; do
+            echo "部署尝试 $attempt/5"
+            if npx --yes wrangler@4.161.0 pages deploy .vuepress/dist \
+              --project-name=bilup-download-list \
+              --branch=main \
+              --commit-hash="${{ github.sha }}" \
+              --commit-dirty=false \
+              --no-bundle; then
+              echo "部署成功"
+              exit 0
+            fi
+            echo "第 $attempt 次部署失败，等待后重试"
+            sleep $((attempt * 10))
+          done
+          echo "部署重试耗尽"
+          exit 1
