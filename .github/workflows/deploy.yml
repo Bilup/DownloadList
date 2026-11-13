@@ -117,10 +117,19 @@ jobs:
           done
           echo "output=${{ steps.detect.outputs.root }}" >> $GITHUB_OUTPUT
 
+      # 上传构建产物供 deploy 作业部署到 Cloudflare Pages。
+      #
+      # 用 upload-artifact 而非 upload-pages-artifact：后者会把整个站点
+      # 打包成单个 artifact.tar，超过 25 MiB 时 Pages 会直接拒绝
+      # （实测 artifact.tar 32.8 MiB → "Pages only supports files up to
+      # 25 MiB in size"）。wrangler pages deploy 需要的是目录本身。
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          path: ${{ steps.build.outputs.output }}
+          name: pages-dist
+          path: ${{ steps.build.outputs.output }}/
+          retention-days: 1
+          if-no-files-found: error
 
       # 代理表副本单独上传，供同步到 KV
       - name: Upload proxy table
@@ -202,8 +211,20 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: github-pages
+          name: pages-dist
           path: .vuepress/dist
+
+      - name: Verify artifact layout
+        run: |
+          # upload-artifact 打包目录时会保留顶层目录名，
+          # 若路径多了一层（dist/dist），wrangler 会部署出空站点。
+          if [ ! -f .vuepress/dist/_worker.js ]; then
+            echo "产物结构异常，_worker.js 不在预期位置。当前结构："
+            find .vuepress/dist -maxdepth 2 -name "_worker.js" -o -maxdepth 2 -name "_routes.json" | head -10
+            ls .vuepress/dist | head -10
+            exit 1
+          fi
+          echo "产物结构正确，文件数：$(find .vuepress/dist -type f | wc -l)"
 
       - name: Diagnose Cloudflare credentials
         env:
