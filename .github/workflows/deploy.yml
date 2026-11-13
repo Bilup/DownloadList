@@ -205,6 +205,24 @@ jobs:
           name: github-pages
           path: .vuepress/dist
 
+      - name: Diagnose Cloudflare credentials
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          echo "account_id=${CLOUDFLARE_ACCOUNT_ID}"
+          echo "token_length=${#CLOUDFLARE_API_TOKEN}"
+          echo "--- token 验证 ---"
+          curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/user/tokens/verify" | head -c 400
+          echo
+          echo "--- 账户验证 ---"
+          curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID" | head -c 300
+          echo
+          echo "--- wrangler 版本 ---"
+          npx --yes wrangler@4.161.0 --version
+
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
