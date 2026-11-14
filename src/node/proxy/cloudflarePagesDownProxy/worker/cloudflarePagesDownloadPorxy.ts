@@ -1071,10 +1071,18 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
      * 空值头在最终响应里又会被 Cloudflare 丢弃 —— 结果就是
      * 响应里彻底没有 accept-ranges。
      *
-     * 后果：aria2 / Motrix / IDM 等靠该头判断能否多线程的工具会退回单线程，
-     * 前端探测也会误判「服务端不支持分段下载」。
+     * 现在无条件覆盖成 bytes，语义最明确，也不受源站行为影响。
      *
-     * 直接覆盖成 bytes，语义最明确，也不受源站行为影响。
+     * 但要知道：**即使 Worker 设置了，客户端也未必能看到**。
+     * 实测（同一文件、同一 Worker 逻辑）：
+     *   不带 Range 的 200 响应 → 有 `Accept-Ranges: bytes`
+     *   带 Range 的 206 响应   → 没有该头
+     * 原因是 Cloudflare 接管缓存后由自己处理 Range 语义，不再透传这个头
+     * （响应走 cf-cache-status: DYNAMIC、不被缓存时才原样透传）。
+     *
+     * 因此**前端判断能否分段下载必须看状态码（206），不能看这个头**；
+     * aria2 / Motrix / IDM 等客户端同样是依据 206 + Content-Range 判断的，
+     * 不受此影响。
      */
     responseHeaders.set("accept-ranges", "bytes");
 

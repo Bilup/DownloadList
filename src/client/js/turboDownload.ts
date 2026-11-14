@@ -127,12 +127,17 @@ export async function probeFile(url: string): Promise<CacheProbe> {
      * 判断「服务端是否支持分段」用的是**状态码**，不是 Accept-Ranges 头。
      *
      * 踩过的坑：早先这里读 `Accept-Ranges` 头，缺头就报错「服务端不支持分段下载」。
-     * 但 Cloudflare 会缓存 Worker 的最终响应（响应带 Cache-Control: max-age=86400,
-     * immutable），而缓存里存的是**旧版本 Worker 写入的条目** —— 那批条目没有
-     * 这个头。更麻烦的是每次命中都会刷新 Age，条目因此无限续命、永不过期，
-     * 于是新代码上线后仍持续命中旧条目。
      *
-     * 状态码则是权威且无歧义的：
+     * 实测结论（同一文件、同一服务端逻辑）：
+     *   不带 Range 的 200 响应 → 有 `Accept-Ranges: bytes`
+     *   带 Range 的 206 响应   → **没有该头**
+     *
+     * 原因：Cloudflare 接管缓存后由自己处理 Range 语义，不再透传这个头
+     * （响应不被缓存、cf-cache-status 为 DYNAMIC 时才原样透传）。
+     * 另外缓存里还可能存着旧版本 Worker 写入的响应快照，
+     * 那种条目更是缺这个头。
+     *
+     * 状态码则没有歧义：
      *   206 → 服务端确实按 Range 截断了内容 → 支持分段
      *   200 → 服务端忽略了 Range，直接返回整个文件 → 不支持
      */
