@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import {ref, computed} from "vue";
+import {ref, computed, onMounted} from "vue";
 import {PageFileData} from "../../../../type/index.js";
 import {fileSizeFormat} from "../../../js/fileSizeFormat.js";
 import {dateFormat} from "../../../js/dateFormat.js";
@@ -9,8 +9,9 @@ import FileTypeIcon from "../../FileTypeIcon.vue";
 import {
     turboDownload,
     turboSupported,
-    buildAria2Command,
     formatSpeed,
+    probeFile,
+    CacheProbe,
     TurboUnsupportedError
 } from "../../../js/turboDownload.js";
 
@@ -22,24 +23,47 @@ const speed = ref(0);
 const finishedChunks = ref(0);
 const totalChunks = ref(0);
 const showPanel = ref(false);
+const threads = ref(4);
+const probing = ref(false);
+const probe = ref<CacheProbe | null>(null);
 
 const canTurbo = computed(() => turboSupported());
 const absoluteUrl = computed(() => new URL(props.file.downloadUrl, window.location.origin).toString());
+
+/** 缓存状态决定建议：未缓存时多线程反而更慢 */
+const advice = computed(() => {
+    if (!probe.value) return null;
+    if (probe.value.cached) {
+        return {
+            tone: "good",
+            text: "文件已在边缘缓存，多线程可直接从边缘取，能突破单连接的延迟瓶颈。"
+        };
+    }
+    return {
+        tone: "warn",
+        text: "文件尚未进入边缘缓存。首次下载需要把整个文件从源站拉下来，" +
+              "此时多个分段会各自触发一次完整回源 —— 多线程反而更慢，建议先用普通下载。"
+    };
+});
 
 function copyLink(){
   navigator.clipboard.writeText(absoluteUrl.value);
   putNotification({message: "链接已复制", type: "success"});
 }
 
-function copyAria2(){
-  const cmd = buildAria2Command(absoluteUrl.value, props.file.name);
-  navigator.clipboard.writeText(cmd);
-  putNotification({message: "aria2 命令已复制，粘贴到 Motrix / aria2 即可多线程下载", type: "success"});
-}
-
-/** 直接用普通方式下载（浏览器原生单连接） */
-function normalDownload(){
-  window.open(absoluteUrl.value, "_blank");
+/** 展开面板时探测一次缓存状态 */
+async function togglePanel(){
+  showPanel.value = !showPanel.value;
+  if (showPanel.value && !probe.value && !probing.value) {
+    probing.value = true;
+    try {
+      probe.value = await probeFile(absoluteUrl.value);
+    } catch (error) {
+      putNotification({message: "无法获取文件信息：" + (error?.message || error), type: "error"});
+    } finally {
+      probing.value = false;
+    }
+  }
 }
 
 /** 多线程分段下载 */
@@ -52,7 +76,7 @@ async function startTurbo(){
   totalChunks.value = 0;
   try {
     await turboDownload(absoluteUrl.value, props.file.name, {
-      threads: 8,
+      threads: threads.value,
       onProgress: (p) => {
         progress.value = p.total > 0 ? p.done / p.total : 0;
         speed.value = p.speed;
@@ -74,6 +98,10 @@ async function startTurbo(){
   }
 }
 
+onMounted(() => {
+  // 面板首次打开时才探测，避免无谓的请求
+});
+
 </script>
 
 <template>
@@ -85,41 +113,57 @@ async function startTurbo(){
     <div class="buttons">
       <AButton class="button-color-grep1" @click="copyLink()">复制链接</AButton>
       <AButton target="_blank" :href="props.file.downloadUrl" v-if="props.file.downloadCorsAllow!='verystrict'">下载</AButton>
-      <AButton class="button-color-grep2 turbo" @click="showPanel=!showPanel" v-if="props.file.downloadCorsAllow!='verystrict'">下载速递</AButton>
+      <button class="mt-btn" @click="togglePanel()" v-if="props.file.downloadCorsAllow!='verystrict'">
+        多线程下载
+      </button>
     </div>
 
-    <div class="turbo-panel" v-if="showPanel">
-      <div class="turbo-title">多线程分段下载</div>
-
-      <div class="turbo-desc" v-if="canTurbo">
-        把文件拆成 8 段并发拉取，速度取决于你的带宽与到 Cloudflare 边缘的链路。
-        文件越大、线程越多，提升越明显。
-      </div>
-      <div class="turbo-desc" v-else>
-        当前浏览器不支持流式写盘（需要 Chrome / Edge）。
-        你仍可复制 aria2 命令，在 Motrix、aria2 等客户端里多线程下载。
-      </div>
-
-      <div class="turbo-actions">
-        <AButton class="button-color-grep2" @click="startTurbo()" v-if="canTurbo">开始加速下载</AButton>
-        <AButton class="button-color-grep1" @click="copyAria2()">复制 aria2 命令</AButton>
-      </div>
-
-      <div class="turbo-progress" v-if="downloading">
-        <div class="bar">
-          <div class="fill" :style="{width: (progress*100).toFixed(1)+'%'}"></div>
+    <transition name="mt">
+      <div class="mt-panel" v-if="showPanel">
+        <div class="mt-head">
+          <span class="mt-title">多线程下载</span>
+          <span class="mt-sub">把文件拆成多段同时拉取</span>
         </div>
-        <div class="turbo-stat">
-          <span>{{(progress*100).toFixed(1)}}%</span>
-          <span>{{formatSpeed(speed)}}</span>
-          <span v-if="totalChunks>0">分段 {{finishedChunks}}/{{totalChunks}}</span>
+
+        <div class="mt-body">
+          <div class="mt-row">
+            <span class="mt-label">并发线程</span>
+            <div class="mt-threads">
+              <button v-for="n in [2,4,8,16]" :key="n"
+                      class="mt-thread" :class="{active: threads===n}"
+                      @click="threads=n" :disabled="downloading">{{n}}</button>
+            </div>
+          </div>
+
+          <div class="mt-tip" :class="advice ? advice.tone : 'loading'" v-if="probing">
+            正在检测边缘缓存状态…
+          </div>
+          <div class="mt-tip" :class="advice.tone" v-else-if="advice">
+            {{ advice.text }}
+          </div>
+
+          <div class="mt-progress" v-if="downloading">
+            <div class="mt-bar">
+              <div class="mt-fill" :style="{width: (progress*100).toFixed(1)+'%'}"></div>
+            </div>
+            <div class="mt-stat">
+              <span class="mt-pct">{{(progress*100).toFixed(1)}}%</span>
+              <span class="mt-speed">{{formatSpeed(speed)}}</span>
+              <span class="mt-chunks" v-if="totalChunks>0">分段 {{finishedChunks}}/{{totalChunks}}</span>
+            </div>
+          </div>
+
+          <div class="mt-actions">
+            <button class="mt-go" @click="startTurbo()" :disabled="downloading || probing">
+              {{ downloading ? '下载中…' : '开始多线程下载' }}
+            </button>
+            <span class="mt-note" v-if="!canTurbo">
+              当前浏览器不支持流式写盘（需 Chrome / Edge），请用普通下载
+            </span>
+          </div>
         </div>
       </div>
-
-      <div class="turbo-hint" v-if="!canTurbo">
-        <code>{{ buildAria2Command(absoluteUrl, props.file.name) }}</code>
-      </div>
-    </div>
+    </transition>
   </div>
 </template>
 
@@ -155,61 +199,185 @@ async function startTurbo(){
   align-items: center;
   padding: 1rem 0;
 }
-.turbo-panel{
-  margin-top: 1.2rem;
-  width: min(38rem, 100%);
-  padding: 1rem 1.2rem;
-  border-radius: 0.8rem;
-  border: 1px solid var(--f-color-2);
-  background-color: var(--f-color-1);
-  font-size: 0.85rem;
+
+/* 主按钮：与站点主题蓝一致 */
+.mt-btn{
+  display: inline-block;
+  border-radius: 0.6rem;
+  padding: 0.6rem 1rem;
+  background-color: var(--t-color-1);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  font-size: inherit;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.mt-btn:hover{
+  opacity: 0.86;
+  transform: translateY(-1px);
+}
+
+/* 面板 */
+.mt-panel{
+  margin-top: 1.4rem;
+  width: min(34rem, 100%);
+  border-radius: 0.9rem;
+  border: 1px solid var(--main-border-c);
+  background-color: var(--mian-box-bgc);
+  box-shadow: var(--mian-box-shadow);
+  overflow: hidden;
+}
+.mt-head{
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.85rem 1.1rem;
+  background-color: var(--page-bgc);
+  border-bottom: 1px solid var(--main-border-c);
+}
+.mt-title{
+  font-weight: 600;
+  color: var(--f-color-0);
+  font-size: 0.95rem;
+}
+.mt-sub{
   color: var(--f-color-2);
+  font-size: 0.78rem;
 }
-.turbo-title{
-  font-weight: bolder;
+.mt-body{
+  padding: 1.1rem;
+}
+
+/* 线程选择 */
+.mt-row{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.9rem;
+}
+.mt-label{
   color: var(--f-color-1);
-  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
 }
-.turbo-desc{
+.mt-threads{
+  display: flex;
+  gap: 0.35rem;
+}
+.mt-thread{
+  min-width: 2.3rem;
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--main-border-c);
+  background-color: transparent;
+  color: var(--f-color-1);
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: all 0.15s;
+}
+.mt-thread:hover:not(:disabled){
+  background-color: var(--main-hover-bg);
+}
+.mt-thread.active{
+  background-color: var(--t-color-1);
+  border-color: var(--t-color-1);
+  color: #fff;
+}
+.mt-thread:disabled{
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 提示条 */
+.mt-tip{
+  border-radius: 0.5rem;
+  padding: 0.65rem 0.8rem;
+  font-size: 0.8rem;
   line-height: 1.6;
   margin-bottom: 0.9rem;
 }
-.turbo-actions{
-  display: flex;
-  gap: 0.8rem;
-  flex-wrap: wrap;
-  justify-content: center;
+.mt-tip.good{
+  background-color: rgba(76, 156, 76, 0.1);
+  color: var(--tip-color-success);
 }
-.turbo-progress{
-  margin-top: 1rem;
+.mt-tip.warn{
+  background-color: rgba(240, 173, 78, 0.14);
+  color: var(--tip-color-warning);
 }
-.bar{
-  height: 0.45rem;
-  border-radius: 0.3rem;
-  background-color: var(--f-color-2);
+.mt-tip.loading{
+  background-color: var(--page-bgc);
+  color: var(--f-color-2);
+}
+
+/* 进度 */
+.mt-progress{
+  margin-bottom: 1rem;
+}
+.mt-bar{
+  height: 0.4rem;
+  border-radius: 0.25rem;
+  background-color: var(--page-bgc);
   overflow: hidden;
 }
-.fill{
+.mt-fill{
   height: 100%;
-  background-color: var(--t-color-1);
+  border-radius: 0.25rem;
+  background: linear-gradient(90deg, var(--t-color-1), #7fd4ff);
   transition: width 0.2s linear;
 }
-.turbo-stat{
+.mt-stat{
   display: flex;
   justify-content: space-between;
-  margin-top: 0.45rem;
-  font-size: 0.8rem;
+  margin-top: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--f-color-2);
+  font-variant-numeric: tabular-nums;
 }
-.turbo-hint{
-  margin-top: 1rem;
-  padding: 0.7rem;
+.mt-pct{
+  color: var(--f-color-0);
+  font-weight: 600;
+}
+.mt-speed{
+  color: var(--t-color-1);
+  font-weight: 600;
+}
+
+/* 行动区 */
+.mt-actions{
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+.mt-go{
+  border: none;
   border-radius: 0.5rem;
-  background-color: var(--f-color-2);
-  word-break: break-all;
-  line-height: 1.5;
+  padding: 0.55rem 1.3rem;
+  background-color: var(--t-color-1);
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.88rem;
+  font-weight: 600;
+  transition: opacity 0.2s;
 }
-.turbo-hint code{
-  font-size: 0.75rem;
-  color: var(--f-color-1);
+.mt-go:hover:not(:disabled){
+  opacity: 0.86;
+}
+.mt-go:disabled{
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.mt-note{
+  color: var(--f-color-2);
+  font-size: 0.76rem;
+}
+
+/* 展开动画 */
+.mt-enter-active, .mt-leave-active{
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.mt-enter-from, .mt-leave-to{
+  opacity: 0;
+  transform: translateY(-6px);
 }
 </style>

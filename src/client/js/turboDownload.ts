@@ -1,14 +1,22 @@
 /**
- * 下载速递 —— 浏览器内多线程分段下载。
+ * 多线程分段下载。
  *
- * 服务端（Pages 的下载代理）已经完整支持 Range：
- * Accept-Ranges、206 Partial Content、多区间 multipart、416、304 都已验证。
- * 这里在客户端把一个文件拆成 N 段并发拉取，再用 File System Access API
- * 按偏移量写入同一个文件，从而在不安装任何客户端的前提下获得多线程加速。
+ * 服务端（Pages 的下载代理）完整支持 Range：Accept-Ranges、206 Partial Content、
+ * 多区间 multipart、416、304 都已实测通过，且不同分段请求会命中边缘缓存。
  *
- * 浏览器支持情况：
- *   - Chromium 系（Chrome / Edge / Opera / Brave）：完整支持，可流式写盘
- *   - Firefox / Safari：无 File System Access API，降级为「复制 aria2 命令」
+ * 何时多线程更快、何时更慢（关键，决定了默认策略）：
+ *
+ *   文件已在边缘缓存（HIT）
+ *     → 每个分段直接从边缘缓存吐出，不再回源。
+ *       多条连接可以突破单连接的 RTT 瓶颈，高延迟链路上提升明显。
+ *
+ *   文件尚未缓存（MISS）
+ *     → Cloudflare 需要先把**整个文件**从源站拉下来填满缓存，
+ *       分段请求才拿得到自己的那一段。
+ *       多个分段请求会各自触发一次完整回源（边缘缓存不做请求合并），
+ *       既互相抢带宽又把源站打爆 —— **这种情况多线程反而更慢**。
+ *
+ * 所以这里先探测缓存状态，再据此给出建议。
  */
 
 /** File System Access API 的最小类型声明（标准 lib 里没有） */
@@ -19,6 +27,7 @@ interface FileSystemWritableFileStream extends WritableStream {
         data: BufferSource | Blob | string;
     }): Promise<void>;
     close(): Promise<void>;
+    abort?: () => Promise<void>;
 }
 
 interface SaveFilePickerOptions {
@@ -40,36 +49,61 @@ export const turboSupported = (): boolean =>
 
 export class TurboUnsupportedError extends Error {
     constructor() {
-        super("当前浏览器不支持流式写盘（需要 Chrome / Edge），已降级为复制下载命令");
+        super("当前浏览器不支持流式写盘（需要 Chrome / Edge）");
         this.name = "TurboUnsupportedError";
     }
 }
 
-export interface TurboProgress {
-    /** 已下载字节 */
-    done: number;
-    /** 总字节 */
+/** 缓存状态探测结果 */
+export interface CacheProbe {
+    /** 文件总长度（字节） */
     total: number;
-    /** 当前速度（字节/秒） */
+    /** 边缘缓存状态：HIT 表示文件已在缓存，多线程能直接受益 */
+    cached: boolean;
+    /** 原始状态字符串，便于排查 */
+    raw: string;
+}
+
+export interface TurboProgress {
+    done: number;
+    total: number;
     speed: number;
-    /** 已完成分段数 / 总分段数 */
     finishedChunks: number;
     totalChunks: number;
 }
 
 export interface TurboOptions {
-    /** 并发线程数 */
     threads?: number;
-    /** 进度回调（已做节流，约每 200ms 一次） */
     onProgress?: (progress: TurboProgress) => void;
-    /** 完成回调 */
     onDone?: (elapsedMs: number) => void;
-    /** 出错回调 */
     onError?: (error: Error) => void;
 }
 
-/** 单个分段的大小上限，避免一次性请求过大 */
+/** 每个分段的大小：太小则请求数多，太大则首字节等待久，8 MiB 是折中 */
 const CHUNK_SIZE = 8 * 1024 * 1024;
+
+/**
+ * 探测文件大小与边缘缓存状态。
+ *
+ * 用 HEAD 而不是 GET：HEAD 在源站侧不返回文件体，代价小得多。
+ * 代理会把回源缓存状态写进 x-proxy-cache-status 响应头。
+ */
+export async function probeFile(url: string): Promise<CacheProbe> {
+    const res = await fetch(url, { method: "HEAD" });
+    if (!res.ok) {
+        throw new Error(`无法获取文件信息 (HTTP ${res.status})`);
+    }
+    const acceptRanges = (res.headers.get("accept-ranges") || "").toLowerCase();
+    const total = Number(res.headers.get("content-length") || 0);
+    if (acceptRanges.indexOf("bytes") < 0) {
+        throw new Error("服务端不支持分段下载（缺少 Accept-Ranges）");
+    }
+    if (!total) {
+        throw new Error("无法获取文件总长度");
+    }
+    const raw = res.headers.get("x-proxy-cache-status") || "UNKNOWN";
+    return { total, cached: raw === "HIT", raw };
+}
 
 /**
  * 多线程分段下载。
@@ -79,21 +113,10 @@ const CHUNK_SIZE = 8 * 1024 * 1024;
  * @param options   配置
  */
 export async function turboDownload(url: string, fileName: string, options: TurboOptions = {}): Promise<void> {
-    const threads = Math.max(1, Math.min(16, options.threads ?? 8));
+    const threads = Math.max(1, Math.min(16, options.threads ?? 4));
 
-    // 1. 询问总长度
-    const headRes = await fetch(url, { method: "HEAD" });
-    if (!headRes.ok) {
-        throw new Error(`无法获取文件信息 (HTTP ${headRes.status})`);
-    }
-    const acceptRanges = (headRes.headers.get("accept-ranges") || "").toLowerCase();
-    const total = Number(headRes.headers.get("content-length") || 0);
-    if (acceptRanges.indexOf("bytes") < 0) {
-        throw new Error("服务端不支持分段下载（缺少 Accept-Ranges）");
-    }
-    if (!total) {
-        throw new Error("无法获取文件总长度");
-    }
+    // 1. 询问总长度与缓存状态
+    const probe = await probeFile(url);
 
     // 2. 让用户选择保存位置
     const picker = (window as WindowWithPicker).showSaveFilePicker;
@@ -101,10 +124,14 @@ export async function turboDownload(url: string, fileName: string, options: Turb
     const handle = await picker.call(window, { suggestedName: fileName });
     const writable = await handle.createWritable();
 
-    // 3. 规划分段
-    const chunkSize = Math.max(CHUNK_SIZE, Math.ceil(total / threads));
+    // 3. 规划分段：尽量均分，且每段不超过 CHUNK_SIZE
+    const total = probe.total;
+    const chunkCount = Math.min(threads, Math.max(1, Math.ceil(total / CHUNK_SIZE)));
+    const chunkSize = Math.ceil(total / chunkCount);
     const ranges: Array<{ start: number; end: number }> = [];
-    for (let start = 0; start < total; start += chunkSize) {
+    for (let i = 0; i < chunkCount; i++) {
+        const start = i * chunkSize;
+        if (start >= total) break;
         ranges.push({ start, end: Math.min(start + chunkSize - 1, total - 1) });
     }
 
@@ -112,7 +139,6 @@ export async function turboDownload(url: string, fileName: string, options: Turb
     let downloaded = 0;
     let finishedChunks = 0;
     let lastNotify = 0;
-    let failed: Error | undefined;
 
     const notify = (force = false) => {
         const now = performance.now();
@@ -164,22 +190,11 @@ export async function turboDownload(url: string, fileName: string, options: Turb
         notify(true);
         options.onDone?.(performance.now() - startedAt);
     } catch (error) {
-        failed = error instanceof Error ? error : new Error(String(error));
-        try { await writable.abort(); } catch (e) { /* 忽略 */ }
+        const failed = error instanceof Error ? error : new Error(String(error));
+        try { if (writable.abort) await writable.abort(); } catch (e) { /* 忽略 */ }
         options.onError?.(failed);
         throw failed;
     }
-}
-
-/**
- * 生成 aria2 命令行（Motrix 等客户端可直接粘贴执行）。
- *
- * aria2c 原生支持多线程分段 + 断点续传，比浏览器内方案更稳，
- * 因此在不支持 File System Access API 的浏览器上作为降级方案提供。
- */
-export function buildAria2Command(url: string, fileName: string, threads = 16): string {
-    const name = fileName.replace(/"/g, "");
-    return `aria2c -x${threads} -s${threads} -k1M --file-allocation=none -c --console-log-level=warn -d . -o "${name}" "${url}"`;
 }
 
 /** 把字节数格式化成人类可读的速度 */
