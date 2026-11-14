@@ -146,30 +146,74 @@ async function main() {
     const value = JSON.stringify(table);
 
     /**
-     * 按分片拆分代理表。
+     * 按分片拆分代理表，分片位数按表体积自适应。
      *
      * KV 单个值的上限是 25 MiB，超过会被 API 拒绝：
      *   HTTP 413 {"code":10024,"message":"Value size ... exceeds maximum allowed size of 25MiB"}
      * （实测 25 MiB 可写入、26 MiB 被拒）
      *
      * 整表放在一个键里迟早会撞上限，撞上之后同步作业失败，
-     * 新版本就发布不出去。因此按「代理键的首位十六进制字符」拆成 16 片，
-     * 每片一个 KV 键。代理键本身就是 sha1(源URL) 的前 16 位，
-     * 天然均匀分布，且查表时能直接由 key 定位分片，无需额外索引。
+     * 新版本就发布不出去。因此按「代理键的十六进制前缀」拆片，
+     * 每片一个 KV 键。代理键本身是 sha1(源URL) 前 16 位（历史键为
+     * hashCode 十进制串），落在十六进制字符集内，前缀分布天然均匀，
+     * 查表时能直接由 key 定位分片，无需额外索引表。
      *
-     * 16 片的总容量 = 16 × 25 MiB = 400 MiB 原始数据，
-     * 按每版本约 10 KiB 计，约可支撑 39000 个 release。
+     * **分片位数自适应**：按当前表体积挑一个最小的 shardBits，
+     * 保证最坏分片不超过单值上限的一半（留足余量）。
+     *   shardBits=1 → 16 片
+     *   shardBits=2 → 256 片
+     *   shardBits=3 → 4096 片
+     * 位数写进 manifest 键，Worker 据此定位分片。
+     * 表变大时自动细分，不需要改代码、不需要重新部署站点。
      */
-    const SHARD_COUNT = 16;
     const VALUE_LIMIT = 25 * 1024 * 1024;
+    // 单片目标上限：单值上限的一半，留出余量
+    const SHARD_TARGET_BYTES = VALUE_LIMIT / 2;
 
-    const shards = new Map();
-    for (const [key, entry] of Object.entries(table)) {
-        const first = key.charAt(0).toLowerCase();
-        const shardId = /^[0-9a-f]$/.test(first) ? first : "0";
-        if (!shards.has(shardId)) shards.set(shardId, {});
-        shards.get(shardId)[key] = entry;
+    /**
+     * 规范化代理键，用于计算分片前缀。
+     * 与 Worker 侧 normalizeKeyForSharding 保持一致。
+     */
+    function normalizeKey(key) {
+        if (/^[0-9a-f]{16}$/i.test(key)) return key.toLowerCase();
+        if (/^-?\d+$/.test(key)) return key.replace(/^-/, "").padStart(8, "0");
+        return key.toLowerCase();
     }
+
+    /** 按给定的分片位数切分代理表 */
+    function splitByBits(bits) {
+        const buckets = new Map();
+        for (const [key, entry] of Object.entries(table)) {
+            const id = normalizeKey(key).slice(0, bits);
+            if (!buckets.has(id)) buckets.set(id, {});
+            buckets.get(id)[key] = entry;
+        }
+        return buckets;
+    }
+
+    // 选最小的 shardBits，使最坏分片不超过目标上限
+    let shardBits = 1;
+    let shards = splitByBits(1);
+    for (let bits = 1; bits <= 4; bits++) {
+        const candidate = splitByBits(bits);
+        let worst = 0;
+        for (const entries of candidate.values()) {
+            worst = Math.max(worst, JSON.stringify(entries).length);
+        }
+        if (worst <= SHARD_TARGET_BYTES) {
+            shardBits = bits;
+            shards = candidate;
+            break;
+        }
+        shardBits = bits;
+        shards = candidate;
+        if (bits === 4) {
+            throw new Error(
+                `代理表 ${value.length} 字节过大，即使用 65536 片仍超出单值上限 ${VALUE_LIMIT}`
+            );
+        }
+    }
+    log(`分片位数: shardBits=${shardBits}（最多 ${Math.pow(16, shardBits)} 片，实际非空 ${shards.size} 片）`);
 
     const shardBodies = new Map();
     for (const [shardId, entries] of shards) {
@@ -178,7 +222,7 @@ async function main() {
             throw new Error(
                 `分片 ${shardId} 有 ${Object.keys(entries).length} 条，` +
                 `${body.length} 字节已超过 KV 单值上限 ${VALUE_LIMIT} 字节。` +
-                `需要增加分片数量（当前 ${SHARD_COUNT} 片）。`
+                `需要增加分片位数（当前 shardBits=${shardBits}）。`
             );
         }
         shardBodies.set(shardId, body);
@@ -187,8 +231,8 @@ async function main() {
     /**
      * 读取分片清单，跳过内容未变化的分片。
      *
-     * KV 免费版每日写入上限 1000 次，若每次同步都写全部 16 片，
-     * 一天迭代 60 次就会撞限。清单里记录各分片当前内容的哈希，
+     * KV 免费版每日写入上限 1000 次，若每次同步都写全部分片，
+     * 一天迭代几十次就会撞限。清单里记录各分片当前内容的哈希，
      * 只有变化了的分片才需要写入。
      */
     let manifest = null;
@@ -206,6 +250,7 @@ async function main() {
     }
 
     const prevShards = (manifest && manifest.shards) || {};
+    const prevShardBits = (manifest && manifest.shardBits) || 1;
     let written = 0;
     let skipped = 0;
     const newShards = {};
@@ -235,6 +280,23 @@ async function main() {
         written++;
     }
 
+    // 分片位数变化时，清理不再使用的旧分片，避免占用存储配额。
+    // 清理后仍在使用旧 manifest 的边缘节点会读不到分片，
+    // 但整表键里始终是最新数据，会自动兜底。
+    if (prevShardBits !== shardBits) {
+        const stale = Object.keys(prevShards).filter((id) => !(id in newShards));
+        for (const id of stale) {
+            await new Promise((r) => setTimeout(r, WRITE_INTERVAL_MS));
+            await cf(
+                kvValuePath(accountId, namespaceId, KV_SHARD_PREFIX + id),
+                { method: "DELETE" }
+            );
+        }
+        if (stale.length > 0) {
+            log(`分片位数 ${prevShardBits} → ${shardBits}，清理旧分片 ${stale.length} 个`);
+        }
+    }
+
     // 整表键保留一份作兜底：分片读取失败或迁移期未覆盖到时仍能查到。
     // 体积超过上限时跳过写入 —— 分片已经是完整数据源，不影响功能。
     const valueUsage = value.length / VALUE_LIMIT;
@@ -248,21 +310,22 @@ async function main() {
         log(`整表 ${value.length} 字节已超单值上限，跳过整表键（分片已是完整数据源）`);
     }
 
-    // 写入清单，供下次同步比对
+    // 写入清单，供下次同步比对，并告知 Worker 当前的分片位数
     await new Promise((r) => setTimeout(r, WRITE_INTERVAL_MS));
     await cf(
         kvValuePath(accountId, namespaceId, KV_MANIFEST_KEY),
-        { method: "PUT", body: JSON.stringify({ shards: newShards, count }) }
+        { method: "PUT", body: JSON.stringify({ shardBits, shards: newShards, count }) }
     );
 
     const totalShardBytes = [...shardBodies.values()].reduce((a, b) => a + b.length, 0);
+    const worstShardBytes = Math.max(...shardBodies.values().map((b) => b.length));
     log(`分片写入完成: 写入 ${written} 片，跳过 ${skipped} 片（未变化），` +
-        `共 ${shardBodies.size} 片 / ${totalShardBytes} 字节` +
-        `（整表 ${value.length} 字节，占单片上限 ${(valueUsage * 100).toFixed(2)}%）`);
+        `共 ${shardBodies.size} 片 / ${totalShardBytes} 字节，` +
+        `最大片 ${worstShardBytes} 字节（占单值上限 ${(worstShardBytes * 100 / VALUE_LIMIT).toFixed(2)}%）`);
 
-    if (valueUsage > 0.5) {
-        log(`⚠ 整表已占单片上限的 ${(valueUsage * 100).toFixed(1)}%，` +
-            `接近上限时需要增加分片数量（当前 ${SHARD_COUNT} 片）`);
+    if (worstShardBytes > VALUE_LIMIT / 2) {
+        log(`⚠ 最大分片已占单值上限的 ${(worstShardBytes * 100 / VALUE_LIMIT).toFixed(1)}%，` +
+            `下轮同步将自动增加分片位数（当前 shardBits=${shardBits}）`);
     }
 
     // 写入 GitHub 令牌，供代理用 asset API 回源

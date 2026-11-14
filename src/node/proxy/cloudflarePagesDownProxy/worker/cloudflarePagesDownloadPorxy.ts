@@ -102,44 +102,65 @@ export function findProxyEntry(pathname: string, proxyConfig: { [key: string]: P
 export const KV_TABLE_KEY = "proxy-table";
 
 /**
- * 代理表分片数量。
+ * 代理表分片配置。
  *
  * KV 单个值上限 25 MiB（实测 25 MiB 可写、26 MiB 返回 HTTP 413），
- * 而整张表放在一个键里迟早会撞上限 —— 一旦撞上，KV 拒绝写入，
+ * 而整表放在一个键里迟早会撞上限 —— 一旦撞上，KV 拒绝写入，
  * 同步作业失败，新版本就发布不出去。
  *
- * 分片依据：代理键本身就是 sha1(源URL) 的前 16 位十六进制，
- * 取其**首位字符**作为分片号，天然均匀、无需额外索引。
- * 因此查表时可以直接由请求里的 key 定位到分片，不必读整表。
+ * 分片依据：代理键本身的十六进制前缀。代理键有两种形态：
+ *   - sha1 前 16 位十六进制（新键），如 "760ae7081ada9d46"
+ *   - 历史 hashCode 的十进制字符串（旧别名键），如 "24542234"、"-2123456789"
+ * 两者都落在十六进制字符集内，前缀分布天然均匀，无需额外索引表。
  *
- * 16 片的容量：每片上限 25 MiB → 原始数据合计 400 MiB，
- * 按每版本约 10 KiB 计，约可支撑 39000 个 release。
+ * **分片位数是自适应的**：同步脚本按当前表体积选择 shardBits 写进 manifest，
+ * Worker 读 manifest 后据此定位分片。表变大时自动细分，
+ * 不需要改代码、不需要重新部署站点。
  *
- * 分片键命名：proxy-table.shard.<0-f>
+ *   shardBits=1 → 16 片   （当前）
+ *   shardBits=2 → 256 片
+ *   shardBits=3 → 4096 片
+ *
+ * 分片键命名：proxy-table.shard.<前缀>
  *
  * 注意：键名里不能出现 `#`、`?`、`/` —— `#` 在 URL 中是 fragment 分隔符，
  * 会被解析层丢弃，导致请求落到错误的键上。这里统一用 `.` 作分隔符。
  */
-export const KV_SHARD_COUNT = 16;
-
-/** 分片键前缀 */
 export const KV_SHARD_PREFIX = KV_TABLE_KEY + ".shard.";
 
-/** 分片清单键，记录各分片的当前内容哈希，用于跳过未变化的写入 */
+/** 分片清单键，记录分片位数与各分片内容哈希 */
 export const KV_MANIFEST_KEY = KV_TABLE_KEY + ".manifest";
 
+/** 默认分片位数：读不到 manifest 时的兜底（与首个版本一致） */
+export const KV_DEFAULT_SHARD_BITS = 1;
+
 /**
- * 从代理键推导分片号。
+ * 把代理键规范化为用于分片的十六进制前缀。
  *
- * 代理键有两种形态：
- *   - sha1 前 16 位十六进制（新键），如 "760ae7081ada9d46"
- *   - 历史 hashCode 的十进制字符串（旧别名键），如 "24542234"
- * 两种形态的首字符都落在 0-9a-f 范围内，可直接作为分片号。
+ * sha1 键原样返回；十进制别名键去掉符号后左补零到 8 位，
+ * 使其同样落在 0-9a-f 的十六进制空间里。
+ * 早期实现直接取首字符，导致所有负数别名键（首字符是 "-"）
+ * 全被归入同一个分片，该片体积是其他片的 2-3 倍。
  */
-export function shardIdOf(key: string): string {
-    if (!key) return "0";
-    const first = key.charAt(0).toLowerCase();
-    return /^[0-9a-f]$/.test(first) ? first : "0";
+export function normalizeKeyForSharding(key: string): string {
+    if (/^[0-9a-f]{16}$/i.test(key)) return key.toLowerCase();
+    if (/^-?\d+$/.test(key)) {
+        const digits = key.replace(/^-/, "");
+        return digits.padStart(8, "0");
+    }
+    return key.toLowerCase();
+}
+
+/**
+ * 由代理键计算分片标识。
+ *
+ * @param key 代理键
+ * @param shardBits 分片位数，取规范化前缀的前 shardBits 个字符
+ */
+export function shardIdOf(key: string, shardBits?: number): string {
+    const bits = typeof shardBits === "number" && shardBits > 0 ? shardBits : KV_DEFAULT_SHARD_BITS;
+    const normalized = normalizeKeyForSharding(key);
+    return normalized.slice(0, bits);
 }
 
 /** KV 存储接口（只声明用到的部分，便于在无 KV 绑定的环境复用同一份核心逻辑） */
@@ -248,6 +269,35 @@ export async function findEntryFromKV(
 }
 
 /**
+ * 读取分片清单，得到当前的分片位数。
+ *
+ * 清单很小（几十到几百字节），且与代理表同周期刷新，
+ * 因此单独用较长的模块级缓存，避免每次下载都读一次 KV。
+ *
+ * 读不到时返回默认位数（1），与首个版本的分片方式保持一致，
+ * 保证升级过程中平滑过渡。
+ */
+async function getShardBits(kv: KVStore | undefined): Promise<number> {
+    if (!kv) return KV_DEFAULT_SHARD_BITS;
+    const cached = readModuleCache(manifestCache);
+    if (cached) return cached.value;
+
+    let bits = KV_DEFAULT_SHARD_BITS;
+    try {
+        const raw = await kv.get(KV_MANIFEST_KEY, { type: "text", cacheTtl: 30 });
+        if (typeof raw === "string" && raw.length > 0) {
+            const parsed = JSON.parse(raw);
+            const n = parsed && parsed.shardBits;
+            if (typeof n === "number" && n > 0 && n <= 4) bits = n;
+        }
+    } catch (error) {
+        // 清单读取失败时用默认位数，后续还有整表与内联表两层兜底
+    }
+    manifestCache = { value: bits, expiresAt: Date.now() + PROXY_TABLE_TTL_MS };
+    return bits;
+}
+
+/**
  * 在单个分片内查找指定键，必要时回退整表与内联表。
  */
 async function lookupByShard(
@@ -257,7 +307,8 @@ async function lookupByShard(
 ): Promise<ProxyEntry | undefined> {
     if (!kv) return fallback[key];
 
-    const shardId = shardIdOf(key);
+    const shardBits = await getShardBits(kv);
+    const shardId = shardIdOf(key, shardBits);
     const shardKey = KV_SHARD_PREFIX + shardId;
 
     try {
@@ -282,7 +333,10 @@ async function lookupByShard(
         // 分片读取失败不致命，继续走整表与内联兜底
     }
 
-    // 迁移期兜底：整表键（内容可能已过时，但能覆盖分片未覆盖到的条目）
+    // 兜底：整表键。
+    // 除迁移期外，它还有另一个作用 —— 当分片位数刚变更时，
+    // 部分边缘节点可能还在用旧的 manifest 算分片号，
+    // 整表键里始终是最新数据，能保证新版本的链接不会 404。
     const legacy = await loadProxyConfigFromKV(kv, fallback);
     const hit = legacy[key];
     if (hit && typeof hit.url === "string" && hit.url.length > 0) return hit;
@@ -390,6 +444,9 @@ let proxyTableCache: ModuleCacheEntry<{ [key: string]: ProxyEntry }> | undefined
  * 分片键形如 proxy-table#<0-f>，每个分片约 1/16 的表数据。
  */
 const shardCache = new Map<string, ModuleCacheEntry<{ [key: string]: ProxyEntry }>>();
+
+/** 分片清单（shardBits）的模块级缓存 */
+let manifestCache: ModuleCacheEntry<number> | undefined;
 
 /**
  * 本 isolate 生命周期内的 KV 实际读取次数。
@@ -512,9 +569,10 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     // 否则会被静态资源路由接管，永远到不了这里。
     if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0
         && url.pathname.indexOf("/down/") === 0) {
-        // 主动读一个分片，展示分片存储的真实状态。
+        // 主动读清单与一个分片，展示分片存储的真实状态。
         // 诊断端点的路径里没有代理键，走分片查找会回退到整表，
-        // 所以这里显式读取 shard.0。
+        // 所以这里显式读取。
+        const shardBits = await getShardBits(kv);
         let shardSample = null;
         try {
             const raw = await kv.get(KV_SHARD_PREFIX + "0", { type: "text", cacheTtl: 30 });
@@ -549,9 +607,9 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                 shardCacheCount: shardCache.size
             },
             kvUsage: {
-                // 分片模式下，单个分片的上限仍是 25 MiB；
-                // 整表容量 = 分片数 × 单片上限
-                shardCount: KV_SHARD_COUNT,
+                // 分片位数是自适应的，由同步脚本按表体积决定
+                shardBits: shardBits,
+                shardCount: Math.pow(16, shardBits),
                 shardSample: shardSample,
                 tableBytes: proxyTableBytes,
                 tableLimitBytes: 25 * 1024 * 1024,
@@ -559,7 +617,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                     ? Number(((proxyTableBytes / (25 * 1024 * 1024)) * 100).toFixed(3))
                     : 0,
                 // 整表理论容量（原始字节）
-                totalCapacityBytes: KV_SHARD_COUNT * 25 * 1024 * 1024,
+                totalCapacityBytes: Math.pow(16, shardBits) * 25 * 1024 * 1024,
                 // KV 读取速率估算
                 kvReads: kvReadCount,
                 isolateAgeSeconds: Math.round((Date.now() - getIsolateStartAt()) / 1000),
