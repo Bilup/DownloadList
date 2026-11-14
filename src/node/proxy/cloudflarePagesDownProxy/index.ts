@@ -58,7 +58,7 @@ const PROXY_PREFIX = "/down/";
  * **维护规则**：改动 Worker 的响应头构造（新增/修改任何响应头）时，
  * 必须把这里的版本号 +1，否则用户会继续命中旧条目。
  */
-const PROXY_VERSION = 2;
+const PROXY_VERSION = 3;
 
 /** 代理条目的键 -> 条目 */
 const proxyConfig: { [key: string]: ProxyEntry } = {};
