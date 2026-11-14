@@ -1055,8 +1055,10 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
     responseHeaders.set("access-control-allow-origin", "*");
     // 暴露给前端读取的头。x-proxy-cache-status 用于判断文件是否已在边缘缓存，
     // 少了它跨域场景下前端只能看到 UNKNOWN，无法给出「建议多线程/建议普通下载」的提示。
+    // CF-Cache-Status 是判断「当前是否命中边缘缓存」最可靠的信号（由 Cloudflare 自己重写），
+    // 前端优先读它。
     responseHeaders.set("access-control-expose-headers",
-        "Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Proxy-Cache-Status");
+        "Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Proxy-Cache-Status, CF-Cache-Status");
     responseHeaders.set("timing-allow-origin", "*");
 
     /**

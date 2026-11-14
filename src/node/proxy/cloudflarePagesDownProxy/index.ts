@@ -37,29 +37,30 @@ import {bundleProxyWorker, ProxyEntry, resolveWorkerEntry} from "../proxyWorkerB
 const PROXY_PREFIX = "/down/";
 
 /**
- * 下载链接的版本号。
+ * 下载链接的版本后缀。
  *
- * 为什么需要它：
+ * 默认留空 —— 也就是**不带任何查询串**，直接用 /down/<key>/<文件名>。
+ *
+ * 为什么需要这个机制：
  *
  * Cloudflare 会缓存 Worker 的**最终响应**（响应带 `Cache-Control: max-age=86400,
- * immutable` 时），缓存键是完整 URL（含查询串）。缓存命中时 Worker **不会执行**，
- * 直接返回当初缓存的那份响应快照。
+ * immutable` 时），缓存键是完整 URL。缓存命中时 Worker **不会执行**，
+ * 直接返回当初缓存的那份响应快照 —— 所以 Worker 代码更新后，
+ * 已缓存的 URL 不会立刻反映新逻辑。
  *
- * 麻烦之处在于「每次命中都会刷新 Age」—— 旧条目因此**无限续命、永不过期**：
- * Worker 代码更新上线后，用户依然持续命中旧条目，新加的响应头迟迟不生效。
- * 实测确认：同一 URL 第二次请求时 x-proxy-cache-status 与首次完全相同、
- * Age 停在首次的值，说明 Worker 根本没有重新执行。
+ * 麻烦之处在于「每次命中都会刷新 Age」—— 旧条目因此**无限续命、永不过期**。
+ * 需要强制刷新时，给链接加一个版本参数，URL 一变缓存键就变，
+ * Worker 必然重新执行。
  *
- * 解决办法：给链接加一个版本参数。版本一变，URL 就变，缓存键随之改变，
- * Worker 必然重新执行、老条目不再被使用。
+ * **但不要轻易启用**：启用后所有文件的边缘缓存一次性失效，
+ * 用户普遍要重新下一次才能恢复速度，代价远大于收益。
+ * 只在「确实需要让旧 URL 反映新的响应头」时才临时填上（如 "?v=4"），
+ * 用完记得改回空串。
  *
- * **维护规则**：改动 Worker 的响应头构造（新增/修改任何响应头）时，
- * 必须把这里的版本号 +1，否则用户会继续命中旧条目。
- *
- * 注：`Accept-Ranges` 是例外 —— Cloudflare 接管缓存后会自己处理 Range 语义，
- * 不再透传这个头，bump 版本也救不回来。判断分段能力一律看状态码（206）。
+ * 判断缓存命中不需要这个机制：cf-cache-status 由 Cloudflare 自己重写，
+ * 旧快照里也带着，值永远正确。
  */
-const PROXY_VERSION = 3;
+const PROXY_VERSION_SUFFIX = "";
 
 /** 代理条目的键 -> 条目 */
 const proxyConfig: { [key: string]: ProxyEntry } = {};
@@ -156,8 +157,8 @@ async function cloudflarePagesDownProxyInner(sourceUrl: string, fileName: string
     if (!Object.prototype.hasOwnProperty.call(proxyConfig, legacyKey)) {
         proxyConfig[legacyKey] = entry;
     }
-    // 版本参数用于绕开 Cloudflare 对旧响应条目的缓存（见 PROXY_VERSION 的说明）
-    return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName) + "?v=" + PROXY_VERSION;
+    // 版本后缀用于强制刷新边缘缓存（见 PROXY_VERSION_SUFFIX 的说明），默认为空
+    return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName) + PROXY_VERSION_SUFFIX;
 }
 
 function cloudflarePagesDownProxy(): DownProxy {

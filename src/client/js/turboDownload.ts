@@ -58,9 +58,9 @@ export class TurboUnsupportedError extends Error {
 export interface CacheProbe {
     /** 文件总长度（字节） */
     total: number;
-    /** 边缘缓存状态：HIT 表示文件已在缓存，多线程能直接受益 */
+    /** 边缘缓存是否命中：HIT 表示文件已在缓存，多线程能直接受益 */
     cached: boolean;
-    /** 原始状态字符串，便于排查 */
+    /** 原始状态字符串（cf-cache-status），便于排查 */
     raw: string;
 }
 
@@ -175,10 +175,36 @@ export async function probeFile(url: string): Promise<CacheProbe> {
     if (!total) {
         throw new Error("无法获取文件总长度");
     }
-    const raw = (res.headers.get("x-proxy-cache-status") || "UNKNOWN").toUpperCase();
+
+    /**
+     * 缓存状态读 `cf-cache-status`，**不是** `x-proxy-cache-status`。
+     *
+     * 这两个头说的不是一回事：
+     *   cf-cache-status         → Cloudflare 边缘缓存**当前是否命中**
+     *                            （CF 自己重写，永远反映真实状态）
+     *   x-proxy-cache-status   → Worker 内部**回源层**的状态
+     *
+     * 实测踩过的坑：曾经用 x-proxy-cache-status 判断，结果多线程永远被禁用。
+     * 原因是 Cloudflare 会缓存 Worker 的**最终响应**，命中时 Worker 根本不执行，
+     * 直接返回当初缓存的响应快照 —— 快照里的 x-proxy-cache-status
+     * 是写入那一刻的陈旧值（比如当时是 MISS），之后再也没更新过。
+     *
+     * 而 cf-cache-status 由 CF 在每次返回缓存响应时重写，值永远正确。
+     *
+     * 取值含义：
+     *   HIT      → 命中边缘缓存，Range 能直接从完整对象切出 → 多线程有效
+     *   MISS     → 缓存已过期需回源 → 各分段独立回源 → 多线程更慢
+     *   DYNAMIC  → 不走缓存 → 同上
+     *   BYPASS   → 强制回源 → 同上
+     *   EXPIRED  → 陈旧数据，保守当作冷
+     */
+    const raw = (res.headers.get("cf-cache-status")
+        || res.headers.get("x-proxy-cache-status")
+        || "UNKNOWN").toUpperCase();
+    const cached = raw === "HIT";
     // 读掉 2 字节响应体，保持连接干净
     try { await res.arrayBuffer(); } catch (e) { /* 忽略 */ }
-    return { total, cached: raw === "HIT", raw };
+    return { total, cached, raw };
 }
 
 /**
