@@ -17,7 +17,7 @@ declare const PROXY_CONFIG: { [key: string]: ProxyEntry };
 declare const PROXY_OPTIONS: ProxyOptions;
 
 export default {
-    async fetch(request: Request, env?: { PROXY_KV?: KVStore }): Promise<Response> {
-        return downloadProxy(request, PROXY_CONFIG, PROXY_OPTIONS, env && env.PROXY_KV);
+    async fetch(request: Request, env?: { PROXY_KV?: KVStore }, ctx?: ExecutionContext): Promise<Response> {
+        return downloadProxy(request, PROXY_CONFIG, PROXY_OPTIONS, env && env.PROXY_KV, ctx);
     }
 };

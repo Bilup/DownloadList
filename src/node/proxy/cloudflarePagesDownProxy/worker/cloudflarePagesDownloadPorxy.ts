@@ -468,6 +468,95 @@ let manifestCache: ModuleCacheEntry<number> | undefined;
 const inflightOrigins = new Set<string>();
 
 /**
+ * 后台补种记录：缓存键 → 上次补种时刻。
+ *
+ * 用途见 scheduleWarmup 的说明。模块级，粒度是 isolate。
+ */
+const warmupMarks = new Map<string, number>();
+
+/** 同一个文件的补种冷却时间（毫秒） */
+const WARMUP_COOLDOWN_MS = 5 * 60 * 1000;
+
+/**
+ * 后台补种：把完整对象灌进边缘缓存。
+ *
+ * **为什么需要它**
+ *
+ * Cloudflare 缓存的是**完整对象**（200 响应），**不缓存 206 部分响应**。
+ * 这带来一个连锁问题：
+ *   客户端一旦用 Range 请求（多线程下载器、aria2、IDM、浏览器的断点续传），
+ *   回源拿到的是 206 —— 完整对象永远进不了缓存。
+ *   于是后续每一个 Range 请求都要重新跨境回源
+ *   （实测 Fastly 的 x-served-by 是 IAD = 华盛顿节点，CF 边缘在亚洲，
+ *   这一段跨太平洋），每次下载都是「冷」的速度。
+ *
+ * 普通下载（不带 Range）没有这个问题，它会把完整对象缓存下来。
+ * 所以这里的补种是给 Range 客户端兜底：
+ *   响应先正常返回给客户端（不等补种），
+ *   同时在后台异步把完整对象拉一份进缓存，
+ *   之后的 Range 请求就能命中完整对象、直接从边缘切段。
+ *
+ * **为什么用 waitUntil**
+ * 补种是「顺便做的事」，不能拖慢当前响应。
+ * waitUntil 里的任务会在响应发出后继续跑，直到完成才结束 isolate。
+ * 它是子请求，不额外占用 Workers 的请求配额（只占 subrequest，上限 50）。
+ *
+ * **为什么要流式读掉**
+ * 文件动辄上百 MB，不能读进内存（Worker 上限 128 MB）。
+ * 流式读取并丢弃即可 —— I/O 等待不计入 CPU 时间（上限 10ms），
+ * 所以这样跑不会触发 CPU 超限。
+ */
+function scheduleWarmup(
+    ctx: ExecutionContext | undefined,
+    cacheKey: string,
+    sourceUrl: string,
+    headers: Headers,
+    cacheOptions: any
+): void {
+    if (!ctx || typeof (ctx as any).waitUntil !== "function") return;
+
+    const now = Date.now();
+    const last = warmupMarks.get(cacheKey);
+    if (last && now - last < WARMUP_COOLDOWN_MS) return;
+    warmupMarks.set(cacheKey, now);
+
+    // 定期清理，避免 Map 无限增长
+    if (warmupMarks.size > 512) {
+        for (const [k, t] of warmupMarks) {
+            if (now - t > WARMUP_COOLDOWN_MS) warmupMarks.delete(k);
+        }
+    }
+
+    const warmHeaders = new Headers(headers);
+    // 补种必须是不带 Range 的完整请求，否则拉回来的还是片段
+    warmHeaders.delete("range");
+    warmHeaders.delete("if-range");
+
+    ctx.waitUntil((async () => {
+        try {
+            const res = await fetch(sourceUrl, {
+                method: "GET",
+                headers: warmHeaders,
+                redirect: "follow",
+                cf: cacheOptions
+            } as any);
+            if (!res.ok || !res.body) {
+                try { await res.body?.cancel(); } catch (e) { /* 忽略 */ }
+                return;
+            }
+            // 流式读掉，让 Cloudflare 把完整对象缓存下来
+            const reader = res.body.getReader();
+            for (;;) {
+                const { done } = await reader.read();
+                if (done) break;
+            }
+        } catch (error) {
+            // 补种失败不影响当前响应
+        }
+    })());
+}
+
+/**
  * 本 isolate 生命周期内的 KV 实际读取次数。
  *
  * KV 免费额度 10 万次读/天，这个计数用于在诊断端点估算读取速率：
@@ -557,9 +646,9 @@ export function detectClientFamily(request: Request): { family: string; ip: stri
  * @param kv           可选的 KV 存储。不传时使用 proxyConfig；
  *                     传入时以 KV 中的代理表为最新，KV 不可用则回退到 proxyConfig
  */
-export async function downloadProxy(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore): Promise<Response> {
+export async function downloadProxy(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore, ctx?: ExecutionContext): Promise<Response> {
     try {
-        return await downloadProxyInner(request, proxyConfig, options, kv);
+        return await downloadProxyInner(request, proxyConfig, options, kv, ctx);
     } catch (error) {
         // 兜底：任何未捕获的异常都不该变成 Cloudflare 的通用 502 错误页
         // （那种页面没有可读信息，用户和运维都无从判断发生了什么）。
@@ -578,7 +667,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     }
 }
 
-async function downloadProxyInner(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore): Promise<Response> {
+async function downloadProxyInner(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore, ctx?: ExecutionContext): Promise<Response> {
     const opt: ProxyOptions = options || {};
     const url = new URL(request.url);
     const method = (request.method || "GET").toUpperCase();
@@ -953,6 +1042,7 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
     let originResponse: Response;
     let usedSignedUrl = false;
     let lastOriginStatus = 0;
+    const originStartedAt = Date.now();
     try {
         const result = await fetchOriginDedup(candidates, function (candidate) {
             usedSignedUrl = candidate.url !== entry.url;
@@ -983,6 +1073,31 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
             throw new Error("所有候选源地址均不可用");
         }
         originResponse = result;
+
+        /**
+         * 后台补种完整对象缓存。
+         *
+         * 只在「客户端用 Range 请求」且「本次回源没命中完整对象」时才做：
+         *   - 命中完整对象（回源层 cf-cache-status = HIT）说明缓存里已有完整对象，
+         *     Range 是从它切出来的，不需要补种。
+         *   - 否则缓存里只有片段，完整对象永远进不去，后续每个 Range
+         *     都要跨境回源（Fastly 的 POP 在美国 IAD，CF 边缘在亚洲）。
+         *     这时后台异步补一份完整对象，之后所有 Range 都能命中。
+         *
+         * 补种不阻塞当前响应（waitUntil 在响应发出后继续跑）。
+         */
+        if (!wantFresh && request.headers.get("range")) {
+            const originHit = (originResponse.headers.get("cf-cache-status") || "").toUpperCase();
+            if (originHit !== "HIT") {
+                scheduleWarmup(
+                    ctx,
+                    stableCacheKey,
+                    entry.url,
+                    originHeaders,
+                    buildCacheOptions(stableCacheKey, false)
+                );
+            }
+        }
 
         /**
          * 签名过期重试。
@@ -1043,6 +1158,10 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
     if (originAge) {
         responseHeaders.set("x-proxy-origin-age", originAge);
     }
+    // 回源耗时（毫秒）：从发起回源到拿到响应头。
+    // 这一段是「CF 边缘 → GitHub → Fastly(America) → 源站」的跨境链路，
+    // 是首次下载慢的根源，用它来观测补种与缓存命中的效果。
+    responseHeaders.set("x-proxy-origin-time", String(Date.now() - originStartedAt));
 
     // 内容处置：可预览类型内联，其余作为附件下载
     const inline = isPreviewable(entry.type, entry.name);
