@@ -31,30 +31,41 @@ const canTurbo = computed(() => turboSupported());
 const absoluteUrl = computed(() => new URL(props.file.downloadUrl, window.location.origin).toString());
 
 /**
+ * 多线程是否可用。
+ *
+ * 只有**文件已在边缘缓存**时才启用。实测依据：
+ *
+ *   Cloudflare 缓存的是完整对象，不缓存 206 部分响应。
+ *   冷缓存时，N 个分段各自独立回源，源站要同时扛 N 个并发连接 ——
+ *   实测 16 段并发时聚合速度只有 301 KB/s，比单线程的 478 KB/s 还慢。
+ *   热缓存时，8 段并发实测全部 HIT（零回源），分段直接从边缘切出。
+ *
+ *   所以冷缓存下让用户点下去，注定是更慢的结果 —— 直接禁用，
+ *   并给出「先用普通下载」的出路（普通下载会把完整对象缓存下来，
+ *   下次打开面板就能用多线程了）。
+ */
+const turboReady = computed(() => !!probe.value && probe.value.cached);
+
+/**
  * 缓存状态决定建议。
  *
- * 实测结论（同一文件 8 线程并发请求冷缓存）：
- *   7 个 HIT + 1 个 MISS —— 代理侧有同址回源去重，
- *   并不会「每个分段各自完整回源」，冷启动只是多等缓存填充的时间。
- *
- * 但架构上确实存在一个结构性差异：
- *   边缘缓存保存的是完整对象，冷缓存时必须等整个文件回源完毕，
- *   分段请求才能切出自己那一段；单线程则是边回源边转发，用户立刻开始收数据。
- *   所以**首次下载**多线程不占优势，缓存热了之后才真正快。
+ * 结论来自实测（同一文件、同一文件大小）：
+ *   冷缓存：16 段并发聚合速度 301 KB/s，慢于单线程的 478 KB/s
+ *   热缓存：8 段并发全部命中边缘缓存，零回源
  */
 const advice = computed(() => {
     if (!probe.value) return null;
     if (probe.value.cached) {
         return {
             tone: "good",
-            text: "文件已在边缘缓存，各分段可直接从边缘切出，多线程能突破单连接的延迟瓶颈。"
+            text: "文件已在边缘缓存，各分段直接从边缘切出，无需回源。"
         };
     }
     return {
         tone: "warn",
-        text: "该文件尚未进入边缘缓存，首次下载需先把整个文件回源填充缓存，" +
-              "分段要等缓存就绪才能开始 —— 这时多线程不会更快。" +
-              "本次探测已顺带预热缓存，之后再下同一文件就会快得多。"
+        text: "该文件尚未进入边缘缓存。此时分段会各自独立回源，" +
+              "源站要同时承受多条连接，反而比普通下载更慢 —— " +
+              "请先用普通下载，文件缓存后即可启用多线程。"
     };
 });
 
@@ -63,21 +74,38 @@ function copyLink(){
   putNotification({message: "链接已复制", type: "success"});
 }
 
+/**
+ * 探测缓存状态。
+ *
+ * 冷缓存时普通下载会把完整对象缓存下来，之后再探测就会变成 HIT，
+ * 所以这里做成可重复调用（面板里的「重新检测」按钮）。
+ */
+async function detect(){
+  probing.value = true;
+  try {
+    probe.value = await probeFile(absoluteUrl.value);
+    // 缓存已热时给足线程数；冷缓存时保守一些
+    threads.value = probe.value.cached ? 8 : 4;
+  } catch (error) {
+    probe.value = null;
+    putNotification({message: "无法获取文件信息：" + (error?.message || error), type: "error"});
+  } finally {
+    probing.value = false;
+  }
+}
+
 /** 展开面板时探测一次缓存状态 */
 async function togglePanel(){
   showPanel.value = !showPanel.value;
   if (showPanel.value && !probe.value && !probing.value) {
-    probing.value = true;
-    try {
-      probe.value = await probeFile(absoluteUrl.value);
-      // 缓存已热时给足线程数；冷缓存时保守一些，避免并发等待放大
-      threads.value = probe.value.cached ? 8 : 4;
-    } catch (error) {
-      putNotification({message: "无法获取文件信息：" + (error?.message || error), type: "error"});
-    } finally {
-      probing.value = false;
-    }
+    await detect();
   }
+}
+
+/** 重新探测（普通下载把文件缓存下来之后用） */
+async function recheck(){
+  if (probing.value || downloading.value) return;
+  await detect();
 }
 
 /** 多线程分段下载 */
@@ -144,9 +172,9 @@ onMounted(() => {
           <div class="mt-row">
             <span class="mt-label">并发线程</span>
             <div class="mt-threads">
-              <button v-for="n in [2,4,8,16]" :key="n"
+              <button v-for="n in [2,4,8]" :key="n"
                       class="mt-thread" :class="{active: threads===n}"
-                      @click="threads=n" :disabled="downloading">{{n}}</button>
+                      @click="threads=n" :disabled="downloading || !turboReady">{{n}}</button>
             </div>
           </div>
 
@@ -155,6 +183,9 @@ onMounted(() => {
           </div>
           <div class="mt-tip" :class="advice.tone" v-else-if="advice">
             {{ advice.text }}
+          </div>
+          <div class="mt-tip error" v-else>
+            无法获取缓存状态，请使用普通下载。
           </div>
 
           <div class="mt-progress" v-if="downloading">
@@ -169,8 +200,14 @@ onMounted(() => {
           </div>
 
           <div class="mt-actions">
-            <button class="mt-go" @click="startTurbo()" :disabled="downloading || probing">
+            <button class="mt-go" @click="startTurbo()"
+                    :disabled="downloading || probing || !turboReady">
               {{ downloading ? '下载中…' : '开始多线程下载' }}
+            </button>
+            <a class="mt-plain" :href="props.file.downloadUrl" target="_blank"
+               v-if="probe && !probe.cached">改用普通下载</a>
+            <button class="mt-plain" @click="recheck()" :disabled="probing || downloading">
+              重新检测
             </button>
             <span class="mt-note" v-if="!canTurbo">
               当前浏览器不支持流式写盘（需 Chrome / Edge），请用普通下载
@@ -320,8 +357,12 @@ onMounted(() => {
   color: var(--tip-color-warning);
 }
 .mt-tip.loading{
-  background-color: var(--page-bgc);
-  color: var(--f-color-2);
+    background-color: var(--page-bgc);
+    color: var(--f-color-2);
+}
+.mt-tip.error{
+    background-color: rgba(226, 96, 92, 0.12);
+    color: var(--tip-color-error);
 }
 
 /* 进度 */
@@ -383,8 +424,20 @@ onMounted(() => {
   cursor: not-allowed;
 }
 .mt-note{
-  color: var(--f-color-2);
-  font-size: 0.76rem;
+    color: var(--f-color-2);
+    font-size: 0.76rem;
+}
+
+/* 冷缓存时的替代出路 */
+.mt-plain{
+    color: var(--t-color-1);
+    font-size: 0.84rem;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.15s;
+}
+.mt-plain:hover{
+    border-bottom-color: var(--t-color-1);
 }
 
 /* 展开动画 */

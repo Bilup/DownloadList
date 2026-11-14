@@ -101,24 +101,40 @@ const CHUNK_SIZE = 8 * 1024 * 1024;
 const WRITE_BUFFER_SIZE = 1024 * 1024;
 
 /**
- * 线程启动间隔（毫秒）。
+ * 最大并发线程数。
  *
- * 错开启动而不是齐发：齐发会让 N 个分段在同一瞬间打到 Worker，
- * 既可能撞上 Worker 的并发限制，也让冷缓存时的回源请求挤在一起。
+ * 每个分段都是一次独立的 Worker 请求，超出并发槽的部分会排队，
+ * 排队的分段不仅没提速，还占着连接、白白消耗请求配额
+ * （Workers Free 是 10 万次/天，16 段就是 16 倍消耗）。
+ *
+ * 8 是实测下来收益与开销的平衡点：再往上收益递减，开销线性上升。
  */
-const STAGGER_MS = 120;
+const MAX_THREADS = 8;
 
 /**
  * 探测文件大小与边缘缓存状态。
  *
  * 用 `GET Range: bytes=0-1` 而不是 HEAD —— 实测两者的缓存行为不同：
  *   HEAD → cf-cache-status: DYNAMIC（HEAD 不享受边缘缓存）
- *          首次探测必然报 MISS，对**已缓存**的文件也会误判，
- *          用户会因此看到「多线程反而更慢」的错误警告。
+ *          首次探测必然报 MISS，对**已缓存**的文件也会误判。
  *   GET Range: bytes=0-1 → 准确反映缓存状态，且只传 2 字节。
  *
- * 附带好处：文件尚未缓存时，这次探测会触发一次完整回源，
- * 相当于顺手把边缘缓存预热了 —— 随后的多线程分段就都能直接命中。
+ * 缓存状态的含义（实测得出，决定了整个功能的正确用法）：
+ *
+ *   Cloudflare 缓存的是**完整对象**（200 响应），**不缓存 206 部分响应**。
+ *   所以 Range 请求的回源状态永远是 MISS —— 除非完整对象已经缓存好了，
+ *   此时 Range 请求能直接命中那个完整对象并切出所需区间。
+ *
+ *   实测：某文件普通下载（完整 GET）之前，Range 探测回源状态为 MISS；
+ *        普通下载完成后再探测 → MISS → HIT → HIT。
+ *
+ *   这意味着：
+ *     冷缓存时，N 个分段各自独立回源，源站要承受 N 个并发连接，
+ *     实测 16 段并发时聚合速度只有 301 KB/s，比单线程的 478 KB/s 还慢。
+ *     热缓存时，分段直接从边缘缓存切出，多线程才有真实收益。
+ *
+ *   所以前端据此决定是否启用多线程，而不是「提示一下就算了」——
+ *   冷缓存下让用户点下去，注定是更慢的结果。
  */
 export async function probeFile(url: string): Promise<CacheProbe> {
     const res = await fetch(url, { headers: { Range: "bytes=0-1" } });
@@ -173,7 +189,7 @@ export async function probeFile(url: string): Promise<CacheProbe> {
  * @param options   配置
  */
 export async function turboDownload(url: string, fileName: string, options: TurboOptions = {}): Promise<void> {
-    const threads = Math.max(1, Math.min(16, options.threads ?? 4));
+    const threads = Math.max(1, Math.min(MAX_THREADS, options.threads ?? 4));
 
     // 1. 询问总长度（已探测过则直接复用，避免重复请求）
     const total = options.knownTotal && options.knownTotal > 0
@@ -281,15 +297,15 @@ export async function turboDownload(url: string, fileName: string, options: Turb
     };
 
     try {
-        // 4. 并发拉取各分段（错开启动，避免瞬时打满 Worker 并发）
-        await Promise.all(ranges.map((range, index) => {
-            if (index === 0) return worker(range);
-            return new Promise<void>((resolve, reject) => {
-                setTimeout(() => {
-                    worker(range).then(resolve, reject);
-                }, STAGGER_MS * index);
-            });
-        }));
+        // 4. 并发拉取各分段
+        //
+        // 早先这里让各分段错开 120ms 启动，为的是别让 N 个分段同时打满
+        // Worker 并发槽 —— 但那是在冷缓存场景下的顾虑，而冷缓存下多线程
+        // 整体就没有收益（前端已直接禁用），根本走不到这里。
+        //
+        // 命中边缘缓存时各分段都能立刻从边缘切出、无需排队，
+        // 错开启动只剩纯粹的延迟损耗（16 段就是 1.9 秒），所以直接并发。
+        await Promise.all(ranges.map((range) => worker(range)));
         await writable.close();
         notify(true);
         options.onDone?.(performance.now() - startedAt);
