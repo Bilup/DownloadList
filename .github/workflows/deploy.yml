@@ -1,26 +1,39 @@
-name: Deploy to Cloudflare Pages
+# 代理表同步流水线
+#
+# 架构（与 Cloudflare Pages 的 GitHub 集成配合）：
+#
+#   push 到 main
+#     ├─ Cloudflare Pages 自动构建并部署站点（面板显示「已启用」）
+#     └─ 本流水线：build → sync-kv，把代理表写入 KV
+#
+# 为什么分开：站点的部署与 KV 的更新必须来自同一次构建，否则会出现
+# 「站点已含新版本、KV 还是旧表」的错位，表现为新版本下载链接 404。
+#
+# 这里 build 产出的代理表副本只用于同步 KV，不用于部署；
+# 站点由 CF 集成构建部署，两条路径互不干扰，也不存在竞态。
+#
+# KV 里的代理表是权威数据源，Worker 优先读 KV（按分片懒加载），
+# 构建期内联的静态表仅作兜底。因此后续新增 release 时，
+# 代理表更新只需重跑本流水线，不必重新部署站点 ——
+# 重新部署会清空边缘缓存，导致下载速度骤降。
 
-on:
+name: Sync proxy table to KV
+'on':
   push:
-    branches: [main]
-  workflow_dispatch:
-
+    branches:
+      - main
+  workflow_dispatch: null
 permissions:
   contents: read
-  pages: write
-  id-token: write
-
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: false
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Detect package manager and project dir
         id: detect
         run: |
@@ -52,29 +65,25 @@ jobs:
           echo "pm=$PM" >> $GITHUB_OUTPUT
           echo "lock=$LOCK" >> $GITHUB_OUTPUT
           echo "Detected: root=$ROOT, pm=$PM, lock=$LOCK"
-
       - name: Setup pnpm
         if: steps.detect.outputs.pm == 'pnpm'
         uses: pnpm/action-setup@v4
         with:
           version: 9
-
       - name: Setup Node (with cache)
         if: steps.detect.outputs.lock != ''
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: ${{ steps.detect.outputs.pm }}
-          cache-dependency-path: ${{ steps.detect.outputs.lock }}
-
+          cache: '${{ steps.detect.outputs.pm }}'
+          cache-dependency-path: '${{ steps.detect.outputs.lock }}'
       - name: Setup Node (no cache)
         if: steps.detect.outputs.lock == ''
         uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - name: Install dependencies
-        working-directory: ${{ steps.detect.outputs.root }}
+        working-directory: '${{ steps.detect.outputs.root }}'
         run: |
           case "${{ steps.detect.outputs.pm }}" in
             pnpm) pnpm install --frozen-lockfile || pnpm install ;;
@@ -85,19 +94,18 @@ jobs:
             *)
               echo "No package.json found, skip install";;
           esac
-
       - name: Build
         id: build
-        working-directory: ${{ steps.detect.outputs.root }}
+        working-directory: '${{ steps.detect.outputs.root }}'
         env:
-          # GitHub API 访问令牌，用于提升 API 速率限制并避免匿名请求被限流
-          githubToken: ${{ secrets.githubToken }}
-        run: |
+          githubToken: '${{ secrets.githubToken }}'
+        run: >
           if [ ! -f package.json ]; then
             echo "No build step, using root as output"
             echo "output=${{ steps.detect.outputs.root }}" >> $GITHUB_OUTPUT
             exit 0
           fi
+
 
           if node -e "const s=require('./package.json').scripts||{}; process.exit(s.build?0:1)"; then
             npm run build
@@ -107,71 +115,46 @@ jobs:
             echo "No build script found"; exit 1
           fi
 
+
           # 按优先级探测构建输出目录
+
           # 注意：本项目使用 VuePress 2，输出目录为 .vuepress/dist
-          for d in .vuepress/dist dist out build public _site docs/.vuepress/dist docs/.vitepress/dist .vitepress/dist; do
+
+          for d in .vuepress/dist dist out build public _site docs/.vuepress/dist docs/.vitepress/dist .vitepress/dist;
+          do
             if [ -d "$d" ]; then
               echo "output=${{ steps.detect.outputs.root }}/$d" >> $GITHUB_OUTPUT
               exit 0
             fi
           done
+
           echo "output=${{ steps.detect.outputs.root }}" >> $GITHUB_OUTPUT
-
-      # 上传构建产物供 deploy 作业部署到 Cloudflare Pages。
-      #
-      # 用 upload-artifact 而非 upload-pages-artifact：后者会把整个站点
-      # 打包成单个 artifact.tar，超过 25 MiB 时 Pages 会直接拒绝
-      # （实测 artifact.tar 32.8 MiB → "Pages only supports files up to
-      # 25 MiB in size"）。wrangler pages deploy 需要的是目录本身。
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pages-dist
-          path: ${{ steps.build.outputs.output }}/
-          retention-days: 1
-          if-no-files-found: error
-
-      # 代理表副本单独上传，供同步到 KV
       - name: Upload proxy table
         uses: actions/upload-artifact@v4
         with:
           name: proxy-table
           path: .vuepress/proxy-table.json
           if-no-files-found: ignore
-
-  # 同步代理表到 KV
-  #
-  # 代理表来自 build 作业的同一份构建产物，与随后部署的站点内容完全一致，
-  # 不会出现「站点已含新版、KV 还是旧版」的快照错位。
-  # 同步 KV 不会触发重新部署，边缘缓存得以保留。
   sync-kv:
     needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
-
       - name: Download proxy table
         uses: actions/download-artifact@v4
         with:
           name: proxy-table
           path: .vuepress
-
       - name: Sync proxy table to KV
-        # 未配置 Cloudflare 凭据时跳过，避免因缺少密钥导致流水线失败。
-        # 注意：GitHub 的表达式求值器不允许在 if 条件中引用 secrets 上下文
-        # （无论 job 级还是 step 级，都会导致工作流校验失败），
-        # 因此这里通过 env 把密钥传入，再由脚本自行判断。
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # 供代理用 GitHub asset API 回源（GitHub 阻断 CF 出口 IP 直连 releases/download）
-          GITHUB_TOKEN: ${{ secrets.githubToken }}
+          CLOUDFLARE_API_TOKEN: '${{ secrets.CLOUDFLARE_API_TOKEN }}'
+          CLOUDFLARE_ACCOUNT_ID: '${{ secrets.CLOUDFLARE_ACCOUNT_ID }}'
+          GITHUB_TOKEN: '${{ secrets.githubToken }}'
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo "未配置 CLOUDFLARE_API_TOKEN，跳过代理表同步"
@@ -188,102 +171,24 @@ jobs:
           done
           echo "代理表同步重试耗尽"
           exit 1
-
-  # 部署到 Cloudflare Pages
+__doc__: |-
   #
-  # 由本流水线统一部署，而不是依赖 CF Pages 的 GitHub 集成自动构建：
-  # 后者会在 push 时独立再跑一次构建，于是站点与 KV 代理表分别来自
-  # 两次不同的 GitHub Releases API 快照，新版链接可能点不开（404）。
-  # 统一到这里后，构建 → 同步 KV → 部署站点，全部基于同一份构建产物，
-  # 提交一次即可完成「发布新版 → 站点更新 → 代理生效」的全流程。
-  deploy:
-    needs: [build, sync-kv]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: pages-dist
-          path: .vuepress/dist
-
-      - name: Verify artifact layout
-        run: |
-          # upload-artifact 打包目录时会保留顶层目录名，
-          # 若路径多了一层（dist/dist），wrangler 会部署出空站点。
-          if [ ! -f .vuepress/dist/_worker.js ]; then
-            echo "产物结构异常，_worker.js 不在预期位置。当前结构："
-            find .vuepress/dist -maxdepth 2 -name "_worker.js" -o -maxdepth 2 -name "_routes.json" | head -10
-            ls .vuepress/dist | head -10
-            exit 1
-          fi
-          echo "产物结构正确，文件数：$(find .vuepress/dist -type f | wc -l)"
-
-      - name: Diagnose Cloudflare credentials
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          {
-            echo "### Cloudflare 凭据诊断"
-            echo ""
-            echo "- account_id: ${CLOUDFLARE_ACCOUNT_ID}"
-            echo "- token 长度: ${#CLOUDFLARE_API_TOKEN}"
-            echo ""
-            echo "#### token 验证"
-            curl -s --max-time 30 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              "https://api.cloudflare.com/client/v4/user/tokens/verify" | head -c 400
-            echo ""
-            echo ""
-            echo "#### API 连通性"
-            curl -s -o /dev/null -w "api.cloudflare.com http=%{http_code} time=%{time_total}s\n" --max-time 30 \
-              "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID"
-          } >> $GITHUB_STEP_SUMMARY
-
-      - name: Deploy to Cloudflare Pages
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-            echo "未配置 CLOUDFLARE_API_TOKEN，无法部署到 Cloudflare Pages"
-            exit 1
-          fi
-          # Cloudflare API 偶发 503（no healthy upstream），重试若干次。
-          # 文件上传是幂等的，重试不会产生重复文件。
-          #
-          # 注意：必须开启 pipefail，否则 `cmd | tee` 的退出码取自 tee（恒为 0），
-          # 会把部署失败误判为成功。
-          set -o pipefail
-          for attempt in 1 2 3 4 5; do
-            echo "部署尝试 $attempt/5"
-            if npx --yes wrangler@4.161.0 pages deploy .vuepress/dist \
-              --project-name=bilup-download-list \
-              --branch=main \
-              --commit-hash="${{ github.sha }}" \
-              --commit-dirty=false \
-              --no-bundle 2>&1 | tee /tmp/wrangler.log; then
-              echo "部署成功"
-              exit 0
-            fi
-            echo "第 $attempt 次部署失败，错误摘要见 job summary"
-            sleep $((attempt * 10))
-          done
-          echo "部署重试耗尽"
-          exit 1
-
-      - name: Upload deploy log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: deploy-log
-          path: /tmp/wrangler.log
-          if-no-files-found: ignore
-
+  # 代理表同步流水线
+  #
+  # 架构（与 Cloudflare Pages 的 GitHub 集成配合）：
+  #
+  #   push 到 main
+  #     ├─ Cloudflare Pages 自动构建并部署站点（面板显示"已启用"）
+  #     └─ 本流水线：build → sync-kv，把代理表写入 KV
+  #
+  # 为什么分开：站点的部署必须与 KV 的更新来自同一次构建，否则会出现
+  # 「站点已含新版本、KV 还是旧表」的错位，表现为新版本下载链接 404。
+  #
+  # 这里 build 产出的代理表副本只用于同步 KV，不用于部署；
+  # 站点由 CF 集成构建部署，两条路径互不干扰，也不存在竞态。
+  #
+  # KV 里的代理表是权威数据源，Worker 优先读 KV（按分片懒加载），
+  # 构建期内联的静态表仅作兜底。因此后续新增 release 时，
+  # 代理表更新只需重跑本流水线，不必重新部署站点 ——
+  # 重新部署会清空边缘缓存，导致下载速度骤降。
+  #
