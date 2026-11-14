@@ -450,6 +450,24 @@ const shardCache = new Map<string, ModuleCacheEntry<{ [key: string]: ProxyEntry 
 let manifestCache: ModuleCacheEntry<number> | undefined;
 
 /**
+ * 正在回源中的源地址集合。
+ *
+ * 多线程下载场景下，同一个文件的 N 个分段请求会同时到达。
+ * 冷缓存时它们会各自 MISS 并**各自回源整个文件** ——
+ * 8 线程下载 164MB 就是 8×164MB 的回源流量，
+ * 既拖慢自己，也会把源站打爆。
+ *
+ * 这里做同址去重：第一个请求正常回源，其余请求等待它把
+ * 边缘缓存填好，然后重新请求 —— 那时就会命中缓存。
+ *
+ * **必须是模块级变量**：声明在 handler 体内的话每次请求都会新建一个
+ * Set，跨请求的并发根本看不到彼此，去重等于没做。
+ * 粒度是 isolate —— 同一 isolate 内的并发共享同一份，
+ * 不同节点之间由 Cloudflare 边缘缓存各自处理。
+ */
+const inflightOrigins = new Set<string>();
+
+/**
  * 本 isolate 生命周期内的 KV 实际读取次数。
  *
  * KV 免费额度 10 万次读/天，这个计数用于在诊断端点估算读取速率：
@@ -540,6 +558,27 @@ export function detectClientFamily(request: Request): { family: string; ip: stri
  *                     传入时以 KV 中的代理表为最新，KV 不可用则回退到 proxyConfig
  */
 export async function downloadProxy(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore): Promise<Response> {
+    try {
+        return await downloadProxyInner(request, proxyConfig, options, kv);
+    } catch (error) {
+        // 兜底：任何未捕获的异常都不该变成 Cloudflare 的通用 502 错误页
+        // （那种页面没有可读信息，用户和运维都无从判断发生了什么）。
+        // 这里返回带明确原因的错误，并记入响应头便于排查。
+        const message = error && (error as any).message ? (error as any).message : String(error);
+        const stack = error && (error as any).stack ? String((error as any).stack).slice(0, 400) : "";
+        return new Response("Proxy error: " + message, {
+            status: 500,
+            headers: {
+                "content-type": "text/plain; charset=utf-8",
+                "cache-control": "no-store",
+                "x-proxy-error": message.slice(0, 200),
+                "x-proxy-error-stack": stack
+            }
+        });
+    }
+}
+
+async function downloadProxyInner(request: Request, proxyConfig: { [key: string]: ProxyEntry }, options?: ProxyOptions, kv?: KVStore): Promise<Response> {
     const opt: ProxyOptions = options || {};
     const url = new URL(request.url);
     const method = (request.method || "GET").toUpperCase();
@@ -709,19 +748,6 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
         }
     }
 
-    /**
-     * 正在回源中的源地址集合（模块级）。
-     *
-     * 多线程下载场景下，同一个文件的 N 个分段请求会同时到达。
-     * 冷缓存时它们会各自 MISS 并**各自回源整个文件** ——
-     * 8 线程下载 164MB 就是 8×164MB 的回源流量，
-     * 既拖慢自己，也会把源站打爆。
-     *
-     * 这里做同址去重：第一个请求正常回源，其余请求等待它把
-     * 边缘缓存填好，然后重新请求 —— 那时就会命中缓存。
-     */
-    const inflightOrigins = new Set<string>();
-
     /** 判断响应是否来自边缘缓存 */
     function isCacheHit(response: Response): boolean {
         const status = response.headers.get("cf-cache-status");
@@ -742,7 +768,8 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     async function fetchOriginDedup(
         candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>,
         onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void,
-        bypassCache?: boolean
+        bypassCache?: boolean,
+        onStatus?: (status: number) => void
     ): Promise<Response | undefined> {
         const primary = candidates.length > 0 ? candidates[0].url : "";
         // 强制回源（?fresh=1）不走去重，否则就失去了强制的意义
@@ -750,7 +777,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
             // 有同址请求正在回源，等待缓存填充后重试
             for (let i = 0; i < 12; i++) {
                 await sleep(400);
-                const retry = await fetchOrigin(candidates, onUse, bypassCache);
+                const retry = await fetchOrigin(candidates, onUse, bypassCache, onStatus);
                 if (!retry) return undefined;
                 if (isCacheHit(retry)) return retry;
                 // 仍未命中，放弃等待，直接用这个响应（内容依然正确）
@@ -760,7 +787,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
 
         if (primary && !bypassCache) inflightOrigins.add(primary);
         try {
-            return await fetchOrigin(candidates, onUse, bypassCache);
+            return await fetchOrigin(candidates, onUse, bypassCache, onStatus);
         } finally {
             if (primary && !bypassCache) inflightOrigins.delete(primary);
         }
@@ -779,7 +806,8 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     async function fetchOrigin(
         candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>,
         onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void,
-        bypassCache?: boolean
+        bypassCache?: boolean,
+        onStatus?: (status: number) => void
     ): Promise<Response | undefined> {
         for (const candidate of candidates) {
             try {
@@ -789,6 +817,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                     redirect: "follow",
                     cf: buildCacheOptions(candidate.cacheKey || candidate.url, bypassCache)
                 } as any);
+                if (onStatus) onStatus(response.status);
                 if (response.status === 504 || response.status === 502 || response.status === 404) {
                     try { await response.body?.cancel(); } catch (e) { /* 忽略 */ }
                     continue;
@@ -914,11 +943,34 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
 
     let originResponse: Response;
     let usedSignedUrl = false;
+    let lastOriginStatus = 0;
     try {
         const result = await fetchOriginDedup(candidates, function (candidate) {
             usedSignedUrl = candidate.url !== entry.url;
-        }, wantFresh);
+        }, wantFresh, function (status) {
+            lastOriginStatus = status;
+        });
         if (!result) {
+            /**
+             * 所有候选源地址都不可用。
+             *
+             * 区分两种情况，语义不同：
+             * - 上游返回 404：资源确实不存在（release 被删除、资源被移除），
+             *   这是客户端的问题，返回 404 Not Found。
+             * - 其他（5xx / 网络错误）：源站故障，返回 502 Bad Gateway。
+             *
+             * 混为一谈会让用户以为站点坏了，而实际上只是那个文件没了。
+             */
+            if (lastOriginStatus === 404) {
+                return new Response("Upstream resource not found", {
+                    status: 404,
+                    headers: {
+                        "content-type": "text/plain; charset=utf-8",
+                        "cache-control": "no-store",
+                        "x-proxy-upstream-status": "404"
+                    }
+                });
+            }
             throw new Error("所有候选源地址均不可用");
         }
         originResponse = result;
