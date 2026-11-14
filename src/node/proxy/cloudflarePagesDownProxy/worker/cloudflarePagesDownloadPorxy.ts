@@ -279,8 +279,9 @@ export async function findEntryFromKV(
  */
 async function getShardBits(kv: KVStore | undefined): Promise<number> {
     if (!kv) return KV_DEFAULT_SHARD_BITS;
+    // 注意：readModuleCache 返回的就是 entry.value 本身，不是 entry 对象
     const cached = readModuleCache(manifestCache);
-    if (cached) return cached.value;
+    if (cached !== undefined) return cached;
 
     let bits = KV_DEFAULT_SHARD_BITS;
     try {
@@ -626,7 +627,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                 debugIsolateStartAt: getIsolateStartAt(),
                 debugTimeOrigin: typeof performance !== "undefined" ? performance.timeOrigin : null,
                 readsPerMinutePerColo: kvReadCount > 0
-                    ? Number(((kvReadCount / Math.max(1, (Date.now() - getIsolateStartAt()) / 1000)) * 60).toFixed(3))
+                    ? Number(((kvReadCount / Math.max(60, (Date.now() - getIsolateStartAt()) / 1000)) * 60).toFixed(3))
                     : 0,
                 // KV 免费额度 10 万次读/天
                 kvReadQuotaPerDay: 100000
