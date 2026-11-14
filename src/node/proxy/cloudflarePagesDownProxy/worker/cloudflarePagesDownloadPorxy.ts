@@ -774,15 +774,24 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
         const primary = candidates.length > 0 ? candidates[0].url : "";
         // 强制回源（?fresh=1）不走去重，否则就失去了强制的意义
         if (!bypassCache && primary && inflightOrigins.has(primary)) {
-            // 有同址请求正在回源，等待缓存填充后重试
-            for (let i = 0; i < 12; i++) {
-                await sleep(400);
+            /**
+             * 有同址请求正在回源。等它把边缘缓存填好，就能直接命中。
+             *
+             * 等待间隔递增（150 / 300 / 450 …），因为缓存填充所需时间
+             * 与文件大小成正比：固定间隔要么等太久（白等），
+             * 要么试得太勤（多打几次无用请求）。
+             * 一旦命中缓存立刻返回，不必等到最后一轮。
+             */
+            let lastResponse: Response | undefined;
+            for (let i = 0; i < 8; i++) {
+                await sleep(150 * (i + 1));
                 const retry = await fetchOrigin(candidates, onUse, bypassCache, onStatus);
                 if (!retry) return undefined;
                 if (isCacheHit(retry)) return retry;
-                // 仍未命中，放弃等待，直接用这个响应（内容依然正确）
-                return retry;
+                lastResponse = retry;
             }
+            // 始终没命中缓存：内容依然正确，只是这次没能借到缓存
+            return lastResponse;
         }
 
         if (primary && !bypassCache) inflightOrigins.add(primary);

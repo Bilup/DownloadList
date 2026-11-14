@@ -30,19 +30,31 @@ const probe = ref<CacheProbe | null>(null);
 const canTurbo = computed(() => turboSupported());
 const absoluteUrl = computed(() => new URL(props.file.downloadUrl, window.location.origin).toString());
 
-/** 缓存状态决定建议：未缓存时多线程反而更慢 */
+/**
+ * 缓存状态决定建议。
+ *
+ * 实测结论（同一文件 8 线程并发请求冷缓存）：
+ *   7 个 HIT + 1 个 MISS —— 代理侧有同址回源去重，
+ *   并不会「每个分段各自完整回源」，冷启动只是多等缓存填充的时间。
+ *
+ * 但架构上确实存在一个结构性差异：
+ *   边缘缓存保存的是完整对象，冷缓存时必须等整个文件回源完毕，
+ *   分段请求才能切出自己那一段；单线程则是边回源边转发，用户立刻开始收数据。
+ *   所以**首次下载**多线程不占优势，缓存热了之后才真正快。
+ */
 const advice = computed(() => {
     if (!probe.value) return null;
     if (probe.value.cached) {
         return {
             tone: "good",
-            text: "文件已在边缘缓存，多线程可直接从边缘取，能突破单连接的延迟瓶颈。"
+            text: "文件已在边缘缓存，各分段可直接从边缘切出，多线程能突破单连接的延迟瓶颈。"
         };
     }
     return {
         tone: "warn",
-        text: "文件尚未进入边缘缓存。首次下载需要把整个文件从源站拉下来，" +
-              "此时多个分段会各自触发一次完整回源 —— 多线程反而更慢，建议先用普通下载。"
+        text: "该文件尚未进入边缘缓存，首次下载需先把整个文件回源填充缓存，" +
+              "分段要等缓存就绪才能开始 —— 这时多线程不会更快。" +
+              "本次探测已顺带预热缓存，之后再下同一文件就会快得多。"
     };
 });
 
@@ -58,6 +70,8 @@ async function togglePanel(){
     probing.value = true;
     try {
       probe.value = await probeFile(absoluteUrl.value);
+      // 缓存已热时给足线程数；冷缓存时保守一些，避免并发等待放大
+      threads.value = probe.value.cached ? 8 : 4;
     } catch (error) {
       putNotification({message: "无法获取文件信息：" + (error?.message || error), type: "error"});
     } finally {
@@ -77,6 +91,7 @@ async function startTurbo(){
   try {
     await turboDownload(absoluteUrl.value, props.file.name, {
       threads: threads.value,
+      knownTotal: probe.value ? probe.value.total : 0,
       onProgress: (p) => {
         progress.value = p.total > 0 ? p.done / p.total : 0;
         speed.value = p.speed;

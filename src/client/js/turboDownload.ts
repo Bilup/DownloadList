@@ -74,8 +74,13 @@ export interface TurboProgress {
 
 export interface TurboOptions {
     threads?: number;
+    /** 已知文件总长度；提供则跳过内部探测，避免重复请求 */
+    knownTotal?: number;
+    /** 进度回调（已做节流，约每 200ms 一次） */
     onProgress?: (progress: TurboProgress) => void;
+    /** 完成回调 */
     onDone?: (elapsedMs: number) => void;
+    /** 出错回调 */
     onError?: (error: Error) => void;
 }
 
@@ -83,25 +88,59 @@ export interface TurboOptions {
 const CHUNK_SIZE = 8 * 1024 * 1024;
 
 /**
+ * 写盘缓冲大小。
+ *
+ * File System Access API 的 WritableStream **一次只能处理一个 write**，
+ * 多个并发 write 调用会被串行排队。而网络分块通常只有 64KB 左右，
+ * 169MB 的文件会产生约 2640 次 write 调用 —— 写盘就成了瓶颈，
+ * 多线程下载反而比单线程还慢。
+ *
+ * 所以每个线程先在内存里攒够 1 MiB 再写一次，
+ * write 调用次数降到约 1/16，且内存占用依然恒定。
+ */
+const WRITE_BUFFER_SIZE = 1024 * 1024;
+
+/**
+ * 线程启动间隔（毫秒）。
+ *
+ * 错开启动而不是齐发：齐发会让 N 个分段在同一瞬间打到 Worker，
+ * 既可能撞上 Worker 的并发限制，也让冷缓存时的回源请求挤在一起。
+ */
+const STAGGER_MS = 120;
+
+/**
  * 探测文件大小与边缘缓存状态。
  *
- * 用 HEAD 而不是 GET：HEAD 在源站侧不返回文件体，代价小得多。
- * 代理会把回源缓存状态写进 x-proxy-cache-status 响应头。
+ * 用 `GET Range: bytes=0-1` 而不是 HEAD —— 实测两者的缓存行为不同：
+ *   HEAD → cf-cache-status: DYNAMIC（HEAD 不享受边缘缓存）
+ *          首次探测必然报 MISS，对**已缓存**的文件也会误判，
+ *          用户会因此看到「多线程反而更慢」的错误警告。
+ *   GET Range: bytes=0-1 → 准确反映缓存状态，且只传 2 字节。
+ *
+ * 附带好处：文件尚未缓存时，这次探测会触发一次完整回源，
+ * 相当于顺手把边缘缓存预热了 —— 随后的多线程分段就都能直接命中。
  */
 export async function probeFile(url: string): Promise<CacheProbe> {
-    const res = await fetch(url, { method: "HEAD" });
-    if (!res.ok) {
+    const res = await fetch(url, { headers: { Range: "bytes=0-1" } });
+    if (!res.ok && res.status !== 206) {
         throw new Error(`无法获取文件信息 (HTTP ${res.status})`);
     }
     const acceptRanges = (res.headers.get("accept-ranges") || "").toLowerCase();
-    const total = Number(res.headers.get("content-length") || 0);
+    // 分段响应里总长度在 Content-Range: bytes 0-1/<total> 里
+    const contentRange = res.headers.get("content-range") || "";
+    const totalFromRange = /\/(\d+)\s*$/.exec(contentRange);
+    const total = Number(
+        totalFromRange ? totalFromRange[1] : (res.headers.get("content-length") || 0)
+    );
     if (acceptRanges.indexOf("bytes") < 0) {
         throw new Error("服务端不支持分段下载（缺少 Accept-Ranges）");
     }
     if (!total) {
         throw new Error("无法获取文件总长度");
     }
-    const raw = res.headers.get("x-proxy-cache-status") || "UNKNOWN";
+    const raw = (res.headers.get("x-proxy-cache-status") || "UNKNOWN").toUpperCase();
+    // 读掉 2 字节响应体，保持连接干净
+    try { await res.arrayBuffer(); } catch (e) { /* 忽略 */ }
     return { total, cached: raw === "HIT", raw };
 }
 
@@ -115,8 +154,10 @@ export async function probeFile(url: string): Promise<CacheProbe> {
 export async function turboDownload(url: string, fileName: string, options: TurboOptions = {}): Promise<void> {
     const threads = Math.max(1, Math.min(16, options.threads ?? 4));
 
-    // 1. 询问总长度与缓存状态
-    const probe = await probeFile(url);
+    // 1. 询问总长度（已探测过则直接复用，避免重复请求）
+    const total = options.knownTotal && options.knownTotal > 0
+        ? options.knownTotal
+        : (await probeFile(url)).total;
 
     // 2. 让用户选择保存位置
     const picker = (window as WindowWithPicker).showSaveFilePicker;
@@ -125,7 +166,6 @@ export async function turboDownload(url: string, fileName: string, options: Turb
     const writable = await handle.createWritable();
 
     // 3. 规划分段：尽量均分，且每段不超过 CHUNK_SIZE
-    const total = probe.total;
     const chunkCount = Math.min(threads, Math.max(1, Math.ceil(total / CHUNK_SIZE)));
     const chunkSize = Math.ceil(total / chunkCount);
     const ranges: Array<{ start: number; end: number }> = [];
@@ -165,17 +205,41 @@ export async function turboDownload(url: string, fileName: string, options: Turb
 
         const reader = res.body.getReader();
         let position = range.start;
+        // 攒够 WRITE_BUFFER_SIZE 再落盘，避免 WritableStream 被海量小写入拖垮
+        const buffer = new Uint8Array(WRITE_BUFFER_SIZE);
+        let buffered = 0;
+
+        const flush = async () => {
+            if (buffered === 0) return;
+            await writable.write({ type: "write", position, data: buffer.slice(0, buffered) });
+            position += buffered;
+            buffered = 0;
+        };
+
         try {
             for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                if (value) {
-                    await writable.write({ type: "write", position, data: value });
-                    position += value.byteLength;
-                    downloaded += value.byteLength;
-                    notify();
+                if (!value) continue;
+                const need = value.byteLength;
+                if (buffered + need > buffer.length) {
+                    await flush();
+                    if (need > buffer.length) {
+                        // 单个分块就超过缓冲区，直接整块写入
+                        await writable.write({ type: "write", position, data: value });
+                        position += need;
+                    } else {
+                        buffer.set(value, 0);
+                        buffered = need;
+                    }
+                } else {
+                    buffer.set(value, buffered);
+                    buffered += need;
                 }
+                downloaded += need;
+                notify();
             }
+            await flush();
         } finally {
             try { reader.releaseLock(); } catch (e) { /* 忽略 */ }
         }
@@ -184,8 +248,15 @@ export async function turboDownload(url: string, fileName: string, options: Turb
     };
 
     try {
-        // 4. 并发拉取各分段
-        await Promise.all(ranges.map((range) => worker(range)));
+        // 4. 并发拉取各分段（错开启动，避免瞬时打满 Worker 并发）
+        await Promise.all(ranges.map((range, index) => {
+            if (index === 0) return worker(range);
+            return new Promise<void>((resolve, reject) => {
+                setTimeout(() => {
+                    worker(range).then(resolve, reject);
+                }, STAGGER_MS * index);
+            });
+        }));
         await writable.close();
         notify(true);
         options.onDone?.(performance.now() - startedAt);
