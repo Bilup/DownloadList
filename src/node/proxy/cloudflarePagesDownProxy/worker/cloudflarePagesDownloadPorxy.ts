@@ -379,8 +379,20 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
      * 注意：cacheKey 替换的是「路径与查询串」部分，
      * 因此传入的是源站 URL 的 path+query，而非完整 URL，
      * 避免把 https:// 前缀也计入键中。
+     *
+     * bypass 为真时不写入边缘缓存（用于 ?fresh=1 强制回源）。
      */
-    function buildCacheOptions(stableKey: string): any {
+    function buildCacheOptions(stableKey: string, bypass?: boolean): any {
+        if (bypass) {
+            // cacheTtlByStatus 全 -1 = 任何状态都不缓存，
+            // 保证强制回源拿到的永远是源站最新内容。
+            return {
+                cacheEverything: true,
+                cacheTtl: -1,
+                cacheTtlByStatus: { "200-299": -1, "300-399": -1, "400-599": -1 },
+                cacheKey: stableKey
+            };
+        }
         return {
             cacheEverything: true,
             cacheTtl: ttl,
@@ -409,10 +421,12 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
      * 两种情况都应继续尝试下一个候选。
      *
      * @param onUse 选中某个候选时的回调，用于记录实际走的是哪条路径
+     * @param bypassCache 为真时不写入边缘缓存（强制回源）
      */
     async function fetchOrigin(
         candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>,
-        onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void
+        onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void,
+        bypassCache?: boolean
     ): Promise<Response | undefined> {
         for (const candidate of candidates) {
             try {
@@ -420,7 +434,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                     method: method,
                     headers: candidate.headers,
                     redirect: "follow",
-                    cf: buildCacheOptions(candidate.cacheKey || candidate.url)
+                    cf: buildCacheOptions(candidate.cacheKey || candidate.url, bypassCache)
                 } as any);
                 if (response.status === 504 || response.status === 502 || response.status === 404) {
                     try { await response.body?.cancel(); } catch (e) { /* 忽略 */ }
@@ -516,14 +530,32 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     //   即使显式指定 cf.cacheKey 也会被 Cloudflare 忽略（跨到 GitHub 的
     //   子请求按最终 URL 计算缓存键），实测命中率仅约 6 成。
     // 因此以原始 URL 为主路径，签名地址仅在原始 URL 不可用时兜底。
+    //
+    // 例外：客户端带 ?fresh=1 时强制回源。
+    // 场景是「同一 tag 下替换了同名文件」——原始 URL 没变，边缘缓存里
+    // 仍存着旧内容（默认 TTL 7 天），只有走签名地址才能拿到最新文件。
+    // 签名地址每次都不同，缓存键必然不同，因此必然真回源。
+    const wantFresh = url.searchParams.has("fresh") || url.searchParams.has("nocache");
     const stableCacheKey = toStableCacheKey(entry.url);
     const candidates: Array<{ url: string; headers: Headers; cacheKey?: string }> = [];
-    candidates.push({ url: entry.url, headers: originHeaders, cacheKey: stableCacheKey });
-    if (entry.assetId) {
+
+    if (wantFresh && entry.assetId) {
+        // 强制回源模式：丢弃模块级签名缓存，重新换取一个新签名
+        signedUrlCache.delete(String(entry.assetId));
         const signed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
         if (signed) {
-            const signedHeaders = new Headers(originHeaders);
-            candidates.push({ url: signed, headers: signedHeaders, cacheKey: stableCacheKey });
+            candidates.push({ url: signed, headers: new Headers(originHeaders), cacheKey: stableCacheKey });
+        }
+    }
+
+    if (!wantFresh || candidates.length === 0) {
+        candidates.push({ url: entry.url, headers: originHeaders, cacheKey: stableCacheKey });
+        if (!wantFresh && entry.assetId) {
+            const signed = await resolveSignedUrl(entry.assetId, entry.url, originHeaders);
+            if (signed) {
+                const signedHeaders = new Headers(originHeaders);
+                candidates.push({ url: signed, headers: signedHeaders, cacheKey: stableCacheKey });
+            }
         }
     }
 
@@ -532,7 +564,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     try {
         const result = await fetchOrigin(candidates, function (candidate) {
             usedSignedUrl = candidate.url !== entry.url;
-        });
+        }, wantFresh);
         if (!result) {
             throw new Error("所有候选源地址均不可用");
         }
@@ -618,7 +650,14 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
 
     // 浏览器侧缓存：Release 资源内容不可变
     if (!responseHeaders.has("cache-control")) {
-        responseHeaders.set("cache-control", "public, max-age=86400, immutable");
+        // 强制回源时不留任何缓存，避免调用方拿到被缓存的旧内容
+        responseHeaders.set("cache-control",
+            wantFresh ? "no-store, no-cache, must-revalidate" : "public, max-age=86400, immutable");
+    }
+
+    // 强制回源标记：便于调用方确认本次确实绕过了边缘缓存
+    if (wantFresh) {
+        responseHeaders.set("x-proxy-fresh", "1");
     }
 
     // 仅在未命中边缘缓存的响应上附加实时诊断信息，避免污染缓存

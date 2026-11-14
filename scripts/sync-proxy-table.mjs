@@ -41,31 +41,63 @@ function log(...args) {
     console.log("[sync-kv]", ...args);
 }
 
+/**
+ * 调用 Cloudflare API，失败时自动退避重试。
+ *
+ * 重试的两种触发条件：
+ *   1. HTTP 429 —— KV 对「同一键」限制 1 次/秒。连续推送多个提交、
+ *      或手动重跑工作流时，两次流水线可能在同一秒写同一个键而撞限。
+ *   2. HTTP 5xx —— Cloudflare 偶发 503 (no healthy upstream)。
+ *
+ * 写入操作本身是幂等的（同样的表反复写入结果相同），重试安全。
+ */
 async function cf(path, options = {}) {
     const token = env("CLOUDFLARE_API_TOKEN");
-    const res = await fetch(API + path, {
-        ...options,
-        headers: {
-            Authorization: `Bearer ${token}`,
-            "content-type": "application/json",
-            ...(options.headers || {})
+    const maxAttempts = 6;
+    let lastError = "";
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const res = await fetch(API + path, {
+            ...options,
+            headers: {
+                Authorization: `Bearer ${token}`,
+                "content-type": "application/json",
+                ...(options.headers || {})
+            }
+        });
+        const text = await res.text();
+
+        // KV 的 values 端点返回 application/octet-stream 纯文本，不是 JSON 包装
+        const contentType = res.headers.get("content-type") || "";
+
+        if (res.status === 429 || res.status >= 500) {
+            const retryAfter = Number(res.headers.get("retry-after")) || 0;
+            // 429 至少等 1.2 秒（KV 同键限速是 1 次/秒）
+            const waitMs = Math.max(retryAfter * 1000, 1200) * attempt;
+            lastError = `HTTP ${res.status} ${res.statusText}`;
+            if (attempt < maxAttempts) {
+                log(`API ${path} 返回 ${lastError}，${waitMs}ms 后重试 (${attempt}/${maxAttempts - 1})`);
+                await new Promise((r) => setTimeout(r, waitMs));
+                continue;
+            }
+            throw new Error(`API ${path} 重试耗尽，最后一次失败 (${res.status}): ${text.slice(0, 300)}`);
         }
-    });
-    const text = await res.text();
-    if (!text) return null;
-    // KV 的 values 端点返回 application/octet-stream 纯文本，不是 JSON 包装
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.indexOf("application/json") < 0) return text;
-    let json;
-    try {
-        json = JSON.parse(text);
-    } catch {
-        throw new Error(`API ${path} 返回非 JSON (${res.status}): ${text.slice(0, 300)}`);
+
+        if (!text) return null;
+        if (contentType.indexOf("application/json") < 0) return text;
+
+        let json;
+        try {
+            json = JSON.parse(text);
+        } catch {
+            throw new Error(`API ${path} 返回非 JSON (${res.status}): ${text.slice(0, 300)}`);
+        }
+        if (!json.success) {
+            throw new Error(`API ${path} 失败 (${res.status}): ${JSON.stringify(json.errors).slice(0, 400)}`);
+        }
+        return json.result;
     }
-    if (!json.success) {
-        throw new Error(`API ${path} 失败 (${res.status}): ${JSON.stringify(json.errors).slice(0, 400)}`);
-    }
-    return json.result;
+    throw new Error(`API ${path} 重试耗尽: ${lastError}`);
 }
 
 async function resolveNamespaceId(accountId) {
