@@ -176,6 +176,7 @@ export async function loadProxyConfigFromKV(
         // cacheTtl 设为 30 秒（KV 允许的最小值），让代理表的更新
         // 尽快在各地边缘节点生效。KV 本身是最终一致的，
         // 默认 60 秒会让新版本的下载链接在部分节点短暂 404。
+        kvReadCount++;
         const raw = await kv.get(KV_TABLE_KEY, { type: "text", cacheTtl: 30 });
         if (typeof raw !== "string" || raw.length === 0) return fallback;
         // 记录原始体积，供诊断端点观测 KV 单值用量
@@ -262,6 +263,7 @@ async function lookupByShard(
     try {
         let shard = readModuleCache(shardCache.get(shardKey));
         if (!shard) {
+            kvReadCount++;
             const raw = await kv.get(shardKey, { type: "text", cacheTtl: 30 });
             const parsed = (typeof raw === "string" && raw.length > 0)
                 ? JSON.parse(raw)
@@ -355,7 +357,22 @@ interface ModuleCacheEntry<T> {
 const SIGNED_URL_TTL_MS = 4 * 60 * 1000;
 
 /** KV 代理表的模块级缓存时长：与 KV 自身 30 秒边缘缓存叠加，取 60 秒 */
-const PROXY_TABLE_TTL_MS = 60 * 1000;
+/**
+ * 代理表模块级缓存的存活时间。
+ *
+ * 这个值直接决定 KV 的读取消耗量：
+ * 每个有流量的边缘节点（colo），其 isolate 每隔 TTL 读一次 KV。
+ * 全局 colo 数量在几十的量级，TTL 越短，KV 读取次数呈线性增长。
+ *
+ * Workers KV 免费额度是 10 万次读/天。若 TTL 取 60 秒，
+ * 30 个 colo 就是 30 × 1440 = 4.3 万次/天，逼近配额；
+ * 取 300 秒则降到 8.6 千次/天，几乎不可能撞限。
+ *
+ * 代价是「代理表更新后全网生效」的延迟从 1 分钟变成最多 5 分钟。
+ * 但实际发版流程里 CI 本身就要跑 5-8 分钟，
+ * 多等这几分钟相比 CI 的耗时可以忽略，因此取长 TTL 更划算。
+ */
+const PROXY_TABLE_TTL_MS = 5 * 60 * 1000;
 
 /** GitHub 令牌的模块级缓存时长：令牌有效期以小时计，取 5 分钟 */
 const TOKEN_TTL_MS = 5 * 60 * 1000;
@@ -373,6 +390,18 @@ let proxyTableCache: ModuleCacheEntry<{ [key: string]: ProxyEntry }> | undefined
  * 分片键形如 proxy-table#<0-f>，每个分片约 1/16 的表数据。
  */
 const shardCache = new Map<string, ModuleCacheEntry<{ [key: string]: ProxyEntry }>>();
+
+/**
+ * 本 isolate 生命周期内的 KV 实际读取次数。
+ *
+ * KV 免费额度 10 万次读/天，这个计数用于在诊断端点估算读取速率：
+ * 速率 ≈ kvReadCount / isolate 存活秒数 × 60（次/分钟/节点）。
+ * 乘以有流量的 colo 数量，即为全天的 KV 读取预估。
+ */
+let kvReadCount = 0;
+
+/** 本 isolate 的启动时刻，用于计算存活时长 */
+const isolateStartAt = Date.now();
 
 /**
  * 最近一次从 KV 读到的代理表原始字节数。
@@ -515,7 +544,15 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                     ? Number(((proxyTableBytes / (25 * 1024 * 1024)) * 100).toFixed(3))
                     : 0,
                 // 整表理论容量（原始字节）
-                totalCapacityBytes: KV_SHARD_COUNT * 25 * 1024 * 1024
+                totalCapacityBytes: KV_SHARD_COUNT * 25 * 1024 * 1024,
+                // KV 读取速率估算
+                kvReads: kvReadCount,
+                isolateAgeSeconds: Math.round((Date.now() - isolateStartAt) / 1000),
+                readsPerMinutePerColo: kvReadCount > 0
+                    ? Number(((kvReadCount / Math.max(1, (Date.now() - isolateStartAt) / 1000)) * 60).toFixed(3))
+                    : 0,
+                // KV 免费额度 10 万次读/天
+                kvReadQuotaPerDay: 100000
             }
         }, null, 2), {
             headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
