@@ -400,8 +400,23 @@ const shardCache = new Map<string, ModuleCacheEntry<{ [key: string]: ProxyEntry 
  */
 let kvReadCount = 0;
 
-/** 本 isolate 的启动时刻，用于计算存活时长 */
-const isolateStartAt = Date.now();
+/**
+ * 本 isolate 的启动时刻。
+ *
+ * 必须惰性初始化，不能在模块顶层直接 `const isolateStartAt = Date.now()`：
+ * Cloudflare Workers 在**模块顶层**（无请求上下文）求值时，
+ * `Date.now()` 与 `performance.timeOrigin` 都会返回 0
+ * （实测 debugIsolateStartAt=0、debugTimeOrigin=0），
+ * 导致算出的存活时长变成整个 Unix 时间戳。
+ * 只有在请求处理函数内部调用，时间基准才有效。
+ */
+let isolateStartAt = 0;
+
+/** 在有请求上下文的地方取 isolate 启动时刻，首次调用时记录 */
+function getIsolateStartAt(): number {
+    if (isolateStartAt === 0) isolateStartAt = Date.now();
+    return isolateStartAt;
+}
 
 /**
  * 最近一次从 KV 读到的代理表原始字节数。
@@ -547,13 +562,13 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                 totalCapacityBytes: KV_SHARD_COUNT * 25 * 1024 * 1024,
                 // KV 读取速率估算
                 kvReads: kvReadCount,
-                isolateAgeSeconds: Math.round((Date.now() - isolateStartAt) / 1000),
+                isolateAgeSeconds: Math.round((Date.now() - getIsolateStartAt()) / 1000),
                 // 原始值，便于排查 isolate 启动时刻是否被正确记录
                 debugNow: Date.now(),
-                debugIsolateStartAt: isolateStartAt,
+                debugIsolateStartAt: getIsolateStartAt(),
                 debugTimeOrigin: typeof performance !== "undefined" ? performance.timeOrigin : null,
                 readsPerMinutePerColo: kvReadCount > 0
-                    ? Number(((kvReadCount / Math.max(1, (Date.now() - isolateStartAt) / 1000)) * 60).toFixed(3))
+                    ? Number(((kvReadCount / Math.max(1, (Date.now() - getIsolateStartAt()) / 1000)) * 60).toFixed(3))
                     : 0,
                 // KV 免费额度 10 万次读/天
                 kvReadQuotaPerDay: 100000
