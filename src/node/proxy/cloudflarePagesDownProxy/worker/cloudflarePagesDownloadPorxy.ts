@@ -101,6 +101,47 @@ export function findProxyEntry(pathname: string, proxyConfig: { [key: string]: P
 /** KV 中存放代理条目的 key（所有条目合并为一份 JSON，避免逐条写入） */
 export const KV_TABLE_KEY = "proxy-table";
 
+/**
+ * 代理表分片数量。
+ *
+ * KV 单个值上限 25 MiB（实测 25 MiB 可写、26 MiB 返回 HTTP 413），
+ * 而整张表放在一个键里迟早会撞上限 —— 一旦撞上，KV 拒绝写入，
+ * 同步作业失败，新版本就发布不出去。
+ *
+ * 分片依据：代理键本身就是 sha1(源URL) 的前 16 位十六进制，
+ * 取其**首位字符**作为分片号，天然均匀、无需额外索引。
+ * 因此查表时可以直接由请求里的 key 定位到分片，不必读整表。
+ *
+ * 16 片的容量：每片上限 25 MiB → 原始数据合计 400 MiB，
+ * 按每版本约 10 KiB 计，约可支撑 39000 个 release。
+ *
+ * 分片键命名：proxy-table.shard.<0-f>
+ *
+ * 注意：键名里不能出现 `#`、`?`、`/` —— `#` 在 URL 中是 fragment 分隔符，
+ * 会被解析层丢弃，导致请求落到错误的键上。这里统一用 `.` 作分隔符。
+ */
+export const KV_SHARD_COUNT = 16;
+
+/** 分片键前缀 */
+export const KV_SHARD_PREFIX = KV_TABLE_KEY + ".shard.";
+
+/** 分片清单键，记录各分片的当前内容哈希，用于跳过未变化的写入 */
+export const KV_MANIFEST_KEY = KV_TABLE_KEY + ".manifest";
+
+/**
+ * 从代理键推导分片号。
+ *
+ * 代理键有两种形态：
+ *   - sha1 前 16 位十六进制（新键），如 "760ae7081ada9d46"
+ *   - 历史 hashCode 的十进制字符串（旧别名键），如 "24542234"
+ * 两种形态的首字符都落在 0-9a-f 范围内，可直接作为分片号。
+ */
+export function shardIdOf(key: string): string {
+    if (!key) return "0";
+    const first = key.charAt(0).toLowerCase();
+    return /^[0-9a-f]$/.test(first) ? first : "0";
+}
+
 /** KV 存储接口（只声明用到的部分，便于在无 KV 绑定的环境复用同一份核心逻辑） */
 export interface KVStore {
     /**
@@ -156,6 +197,95 @@ export async function loadProxyConfigFromKV(
     } catch (error) {
         return fallback;
     }
+}
+
+/**
+ * 从路径中提取候选代理键。
+ *
+ * 代理键有两种形态：sha1 前 16 位十六进制（新键）与历史 hashCode
+ * 的十进制字符串（旧别名键）。这里只挑出形似代理键的路径段，
+ * 避免对 "down" 这类固定字面量做无谓的分片查询。
+ */
+export function extractCandidateKeys(pathname: string): string[] {
+    const segments = pathname.split("/").filter(function (s) { return s.length > 0; });
+    const out: string[] = [];
+    for (const segment of segments) {
+        if (/^[0-9a-f]{16}$/i.test(segment) || /^[0-9]{1,12}$/.test(segment)) {
+            out.push(segment);
+        }
+    }
+    return out;
+}
+
+/**
+ * 按分片从 KV 查一条代理条目。
+ *
+ * 查找顺序：
+ *   1. 分片键 proxy-table#<片号> —— 正常路径，只读约 1/16 的数据
+ *   2. 旧的整表键 proxy-table —— 迁移期兜底，也覆盖历史链接
+ *   3. 构建期内联的静态表 —— KV 不可用时的最后兜底
+ *
+ * 分片缺失（返回空）会被负缓存 60 秒，避免对不存在的分片反复回源。
+ */
+export async function findEntryFromKV(
+    kv: KVStore | undefined,
+    pathname: string,
+    fallback: { [key: string]: ProxyEntry }
+): Promise<ProxyEntry | undefined> {
+    const candidates = extractCandidateKeys(pathname);
+    if (candidates.length === 0) {
+        // 路径里没有形似代理键的段，退回整表匹配（兼容非常规历史路径）
+        const table = await loadProxyConfigFromKV(kv, fallback);
+        return findProxyEntry(pathname, table);
+    }
+
+    for (const key of candidates) {
+        const entry = await lookupByShard(kv, key, fallback);
+        if (entry) return entry;
+    }
+    return undefined;
+}
+
+/**
+ * 在单个分片内查找指定键，必要时回退整表与内联表。
+ */
+async function lookupByShard(
+    kv: KVStore | undefined,
+    key: string,
+    fallback: { [key: string]: ProxyEntry }
+): Promise<ProxyEntry | undefined> {
+    if (!kv) return fallback[key];
+
+    const shardId = shardIdOf(key);
+    const shardKey = KV_SHARD_PREFIX + shardId;
+
+    try {
+        let shard = readModuleCache(shardCache.get(shardKey));
+        if (!shard) {
+            const raw = await kv.get(shardKey, { type: "text", cacheTtl: 30 });
+            const parsed = (typeof raw === "string" && raw.length > 0)
+                ? JSON.parse(raw)
+                : {};
+            shard = {
+                value: (parsed && typeof parsed === "object") ? parsed as { [key: string]: ProxyEntry } : {},
+                expiresAt: Date.now() + PROXY_TABLE_TTL_MS
+            };
+            shardCache.set(shardKey, shard);
+        }
+        const hit = shard.value[key];
+        if (hit && typeof hit.url === "string" && hit.url.length > 0) {
+            return hit;
+        }
+    } catch (error) {
+        // 分片读取失败不致命，继续走整表与内联兜底
+    }
+
+    // 迁移期兜底：整表键（内容可能已过时，但能覆盖分片未覆盖到的条目）
+    const legacy = await loadProxyConfigFromKV(kv, fallback);
+    const hit = legacy[key];
+    if (hit && typeof hit.url === "string" && hit.url.length > 0) return hit;
+
+    return fallback[key];
 }
 
 /** 判断内容是否应当内联预览（音视频、图片、PDF） */
@@ -235,6 +365,14 @@ const signedUrlCache = new Map<string, ModuleCacheEntry<string>>();
 
 /** KV 代理表的模块级缓存 */
 let proxyTableCache: ModuleCacheEntry<{ [key: string]: ProxyEntry }> | undefined;
+
+/**
+ * 分片代理表的模块级缓存。
+ *
+ * 按需加载：只缓存实际被访问过的分片。
+ * 分片键形如 proxy-table#<0-f>，每个分片约 1/16 的表数据。
+ */
+const shardCache = new Map<string, ModuleCacheEntry<{ [key: string]: ProxyEntry }>>();
 
 /**
  * 最近一次从 KV 读到的代理表原始字节数。
@@ -353,24 +491,30 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
             moduleCache: {
                 signedUrlCount: signedUrlCache.size,
                 proxyTableCached: readModuleCache(proxyTableCache) !== undefined,
-                tokenCached: readModuleCache(tokenCache) !== undefined
+                tokenCached: readModuleCache(tokenCache) !== undefined,
+                shardCacheCount: shardCache.size
             },
             kvUsage: {
-                // KV 单值上限 25 MiB
+                // 分片模式下，单个分片的上限仍是 25 MiB；
+                // 整表容量 = 分片数 × 单片上限
+                shardCount: KV_SHARD_COUNT,
                 tableBytes: proxyTableBytes,
                 tableLimitBytes: 25 * 1024 * 1024,
                 tableUsagePercent: proxyTableBytes > 0
                     ? Number(((proxyTableBytes / (25 * 1024 * 1024)) * 100).toFixed(3))
-                    : 0
+                    : 0,
+                // 整表理论容量（原始字节）
+                totalCapacityBytes: KV_SHARD_COUNT * 25 * 1024 * 1024
             }
         }, null, 2), {
             headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }
         });
     }
 
-    // 代理表优先取自 KV（可动态更新），不可用时回退到构建期内联的静态表
-    const resolvedConfig = await loadProxyConfigFromKV(kv, proxyConfig);
-    const entry = findProxyEntry(url.pathname, resolvedConfig);
+    // 代理表优先取自 KV（可动态更新），不可用时回退到构建期内联的静态表。
+    // 采用分片查找：按请求中的 key 定位分片，只读约 1/16 的表数据，
+    // 既避免整表超出 KV 单值上限，也让每次下载的 KV 读取量大幅下降。
+    const entry = await findEntryFromKV(kv, url.pathname, proxyConfig);
     if (!entry || !entry.url) {
         return new Response("Not Found", {
             status: 404,

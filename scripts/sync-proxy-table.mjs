@@ -20,6 +20,7 @@
  */
 
 import {readFileSync, existsSync} from "node:fs";
+import {createHash} from "node:crypto";
 import {dirname, resolve} from "node:path";
 import {fileURLToPath} from "node:url";
 
@@ -29,7 +30,23 @@ const ROOT = resolve(HERE, "..");
 const KV_NAMESPACE_TITLE = "bilup-download-proxy";
 const KV_TABLE_KEY = "proxy-table";
 const KV_TOKEN_KEY = "github-token";
+/**
+ * 分片键前缀，与 Worker 侧保持一致。
+ *
+ * 注意：键名里绝不能出现 `#`、`?`、`/` 这类字符 ——
+ * `#` 在 URL 里是 fragment 分隔符，`fetch` 会把它之后的内容丢弃，
+ * 导致请求实际落到别的键上（曾因此把 16 个分片全部误写到整表键）。
+ * 这里用 `.` 作分隔符，同时所有键名一律经 encodeURIComponent 处理。
+ */
+const KV_SHARD_PREFIX = KV_TABLE_KEY + ".shard.";
+/** 分片清单键，记录各分片内容哈希 */
+const KV_MANIFEST_KEY = KV_TABLE_KEY + ".manifest";
 const API = "https://api.cloudflare.com/client/v4";
+
+/** KV 键名统一走这里：URL 编码，防止特殊字符被解释成 URL 语法 */
+function kvValuePath(accountId, namespaceId, key) {
+    return `/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${encodeURIComponent(key)}`;
+}
 
 function env(name) {
     const v = process.env[name];
@@ -129,43 +146,131 @@ async function main() {
     const value = JSON.stringify(table);
 
     /**
-     * KV 单值体积守卫。
+     * 按分片拆分代理表。
      *
-     * Workers KV 单个值的上限是 25 MiB，超过会直接被 API 拒绝：
+     * KV 单个值的上限是 25 MiB，超过会被 API 拒绝：
      *   HTTP 413 {"code":10024,"message":"Value size ... exceeds maximum allowed size of 25MiB"}
-     * 实测 25 MiB 可写入、26 MiB 被拒。
+     * （实测 25 MiB 可写入、26 MiB 被拒）
      *
-     * 这个失败是「响亮」的 —— 同步作业会明确报错，线上继续用旧代理表，
-     * 不会静默损坏。但一旦到了上限，新版本就发布不出去，
-     * 所以提前在流水线里给出预警。
+     * 整表放在一个键里迟早会撞上限，撞上之后同步作业失败，
+     * 新版本就发布不出去。因此按「代理键的首位十六进制字符」拆成 16 片，
+     * 每片一个 KV 键。代理键本身就是 sha1(源URL) 的前 16 位，
+     * 天然均匀分布，且查表时能直接由 key 定位分片，无需额外索引。
+     *
+     * 16 片的总容量 = 16 × 25 MiB = 400 MiB 原始数据，
+     * 按每版本约 10 KiB 计，约可支撑 39000 个 release。
      */
+    const SHARD_COUNT = 16;
     const VALUE_LIMIT = 25 * 1024 * 1024;
-    const usage = value.length / VALUE_LIMIT;
-    if (value.length > VALUE_LIMIT) {
-        throw new Error(
-            `代理表 ${value.length} 字节已超过 KV 单值上限 ${VALUE_LIMIT} 字节 (${(usage * 100).toFixed(1)}%)，` +
-            `KV 会以 HTTP 413 拒绝写入。需要把代理表分片存储。`
-        );
-    }
-    if (usage > 0.5) {
-        log(`⚠ 代理表已占 KV 单值上限的 ${(usage * 100).toFixed(1)}%` +
-            `（${value.length} / ${VALUE_LIMIT} 字节），接近上限时需要考虑分片存储`);
-    } else {
-        log(`代理表体积 ${value.length} 字节，占 KV 单值上限的 ${(usage * 100).toFixed(2)}%`);
+
+    const shards = new Map();
+    for (const [key, entry] of Object.entries(table)) {
+        const first = key.charAt(0).toLowerCase();
+        const shardId = /^[0-9a-f]$/.test(first) ? first : "0";
+        if (!shards.has(shardId)) shards.set(shardId, {});
+        shards.get(shardId)[key] = entry;
     }
 
-    await cf(`/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${KV_TABLE_KEY}`, {
-        method: "PUT",
-        body: value
-    });
-    log(`已写入 KV (${namespaceId}): ${count} 条, ${value.length} 字节，约 60 秒内全网生效`);
+    const shardBodies = new Map();
+    for (const [shardId, entries] of shards) {
+        const body = JSON.stringify(entries);
+        if (body.length > VALUE_LIMIT) {
+            throw new Error(
+                `分片 ${shardId} 有 ${Object.keys(entries).length} 条，` +
+                `${body.length} 字节已超过 KV 单值上限 ${VALUE_LIMIT} 字节。` +
+                `需要增加分片数量（当前 ${SHARD_COUNT} 片）。`
+            );
+        }
+        shardBodies.set(shardId, body);
+    }
+
+    /**
+     * 读取分片清单，跳过内容未变化的分片。
+     *
+     * KV 免费版每日写入上限 1000 次，若每次同步都写全部 16 片，
+     * 一天迭代 60 次就会撞限。清单里记录各分片当前内容的哈希，
+     * 只有变化了的分片才需要写入。
+     */
+    let manifest = null;
+    try {
+        const raw = await cf(
+            kvValuePath(accountId, namespaceId, KV_MANIFEST_KEY),
+            { method: "GET" }
+        );
+        if (typeof raw === "string" && raw.length > 0) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === "object") manifest = parsed;
+        }
+    } catch (error) {
+        log("未找到分片清单，将写入全部分片");
+    }
+
+    const prevShards = (manifest && manifest.shards) || {};
+    let written = 0;
+    let skipped = 0;
+    const newShards = {};
+
+    /**
+     * KV 对同一 namespace 的写入有速率限制，连续快速写入会返回 429。
+     * 实测一次同步 16 片时命中过一次 429（靠退避重试化解）。
+     * 这里主动在片与片之间留出间隔，让写入平滑通过，
+     * 避免每次同步都触发重试、拖慢流水线。
+     */
+    const WRITE_INTERVAL_MS = 150;
+
+    for (const [shardId, body] of shardBodies) {
+        const hash = createHash("sha1").update(body).digest("hex").slice(0, 16);
+        newShards[shardId] = hash;
+        if (prevShards[shardId] === hash) {
+            skipped++;
+            continue;
+        }
+        if (written > 0) {
+            await new Promise((r) => setTimeout(r, WRITE_INTERVAL_MS));
+        }
+        await cf(
+            kvValuePath(accountId, namespaceId, KV_SHARD_PREFIX + shardId),
+            { method: "PUT", body }
+        );
+        written++;
+    }
+
+    // 整表键保留一份作兜底：分片读取失败或迁移期未覆盖到时仍能查到。
+    // 体积超过上限时跳过写入 —— 分片已经是完整数据源，不影响功能。
+    const valueUsage = value.length / VALUE_LIMIT;
+    if (value.length <= VALUE_LIMIT) {
+        await new Promise((r) => setTimeout(r, WRITE_INTERVAL_MS));
+        await cf(kvValuePath(accountId, namespaceId, KV_TABLE_KEY), {
+            method: "PUT",
+            body: value
+        });
+    } else {
+        log(`整表 ${value.length} 字节已超单值上限，跳过整表键（分片已是完整数据源）`);
+    }
+
+    // 写入清单，供下次同步比对
+    await new Promise((r) => setTimeout(r, WRITE_INTERVAL_MS));
+    await cf(
+        kvValuePath(accountId, namespaceId, KV_MANIFEST_KEY),
+        { method: "PUT", body: JSON.stringify({ shards: newShards, count }) }
+    );
+
+    const totalShardBytes = [...shardBodies.values()].reduce((a, b) => a + b.length, 0);
+    log(`分片写入完成: 写入 ${written} 片，跳过 ${skipped} 片（未变化），` +
+        `共 ${shardBodies.size} 片 / ${totalShardBytes} 字节` +
+        `（整表 ${value.length} 字节，占单片上限 ${(valueUsage * 100).toFixed(2)}%）`);
+
+    if (valueUsage > 0.5) {
+        log(`⚠ 整表已占单片上限的 ${(valueUsage * 100).toFixed(1)}%，` +
+            `接近上限时需要增加分片数量（当前 ${SHARD_COUNT} 片）`);
+    }
 
     // 写入 GitHub 令牌，供代理用 asset API 回源
     const ghToken = process.env.GITHUB_TOKEN;
     if (ghToken && ghToken.length > 0) {
         // 先验令牌有效性，失效则直接失败，避免把坏令牌写进 KV
         await checkGitHubToken(ghToken);
-        await cf(`/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${KV_TOKEN_KEY}`, {
+        await cf(kvValuePath(accountId, namespaceId, KV_TOKEN_KEY), {
             method: "PUT",
             body: ghToken
         });
