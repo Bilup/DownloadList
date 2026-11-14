@@ -468,12 +468,22 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     // 否则会被静态资源路由接管，永远到不了这里。
     if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0
         && url.pathname.indexOf("/down/") === 0) {
-        // 主动读一次 KV，让体积数据在首次访问时就是真实的。
-        // 诊断端点是人工访问、频率极低，且 KV 自带 30 秒边缘缓存，代价可忽略。
+        // 主动读一个分片，展示分片存储的真实状态。
+        // 诊断端点的路径里没有代理键，走分片查找会回退到整表，
+        // 所以这里显式读取 shard.0。
+        let shardSample = null;
         try {
-            await loadProxyConfigFromKV(kv, proxyConfig);
+            const raw = await kv.get(KV_SHARD_PREFIX + "0", { type: "text", cacheTtl: 30 });
+            if (typeof raw === "string" && raw.length > 0) {
+                const parsed = JSON.parse(raw);
+                shardSample = {
+                    id: "0",
+                    entries: Object.keys(parsed || {}).length,
+                    bytes: raw.length
+                };
+            }
         } catch (error) {
-            // 读取失败不影响诊断端点本身
+            shardSample = { id: "0", error: "读取失败" };
         }
         const info = detectClientFamily(request);
         const cf = (request as any).cf || {};
@@ -498,6 +508,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                 // 分片模式下，单个分片的上限仍是 25 MiB；
                 // 整表容量 = 分片数 × 单片上限
                 shardCount: KV_SHARD_COUNT,
+                shardSample: shardSample,
                 tableBytes: proxyTableBytes,
                 tableLimitBytes: 25 * 1024 * 1024,
                 tableUsagePercent: proxyTableBytes > 0
