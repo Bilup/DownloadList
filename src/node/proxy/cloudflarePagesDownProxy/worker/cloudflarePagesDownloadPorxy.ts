@@ -548,6 +548,10 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                 // KV 读取速率估算
                 kvReads: kvReadCount,
                 isolateAgeSeconds: Math.round((Date.now() - isolateStartAt) / 1000),
+                // 原始值，便于排查 isolate 启动时刻是否被正确记录
+                debugNow: Date.now(),
+                debugIsolateStartAt: isolateStartAt,
+                debugTimeOrigin: typeof performance !== "undefined" ? performance.timeOrigin : null,
                 readsPerMinutePerColo: kvReadCount > 0
                     ? Number(((kvReadCount / Math.max(1, (Date.now() - isolateStartAt) / 1000)) * 60).toFixed(3))
                     : 0,
