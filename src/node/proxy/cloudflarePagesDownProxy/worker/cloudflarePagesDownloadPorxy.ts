@@ -1062,15 +1062,26 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
     /**
      * 分段下载能力声明。
      *
-     * 无条件补上：源站（Azure Blob）的 206 响应不一定带这个头，
-     * 而 aria2 / Motrix / IDM 等客户端正是靠它判断能否开多线程。
+     * 无条件覆盖，不做「源站没给才补」的判断。
+     *
+     * 踩过的坑：原先写成 `if (!responseHeaders.has("accept-ranges"))`，
+     * 而源站（Azure Blob / GitHub 302 后的对象存储）对 Range 请求返回的
+     * 206 响应里，accept-ranges 这个头**存在但值为空**。
+     * `has()` 只看「是否存在」，于是判断为「已经有了」，跳过了补齐；
+     * 空值头在最终响应里又会被 Cloudflare 丢弃 —— 结果就是
+     * 响应里彻底没有 accept-ranges。
+     *
+     * 后果：aria2 / Motrix / IDM 等靠该头判断能否多线程的工具会退回单线程，
+     * 前端探测也会误判「服务端不支持分段下载」。
+     *
+     * 直接覆盖成 bytes，语义最明确，也不受源站行为影响。
      */
-    if (!responseHeaders.has("accept-ranges")) {
-        responseHeaders.set("accept-ranges", "bytes");
-    }
+    responseHeaders.set("accept-ranges", "bytes");
 
     // 浏览器侧缓存：Release 资源内容不可变
-    if (!responseHeaders.has("cache-control")) {
+    // 用 get() 判空而非 has()：源站可能给出「存在但值为空」的 cache-control，
+    // 那会让条件判断误判为「已有」，而空值头最终会被 Cloudflare 丢弃。
+    if (!responseHeaders.get("cache-control")) {
         // 强制回源时不留任何缓存，避免调用方拿到被缓存的旧内容
         responseHeaders.set("cache-control",
             wantFresh ? "no-store, no-cache, must-revalidate" : "public, max-age=86400, immutable");
