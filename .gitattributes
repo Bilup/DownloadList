@@ -1,0 +1,46 @@
+# 统一行尾符
+#
+# 本项目在 Windows 上开发、Linux 上构建。core.autocrlf=true 会让
+# 工作区存成 CRLF、仓库存成 LF，导致同一份文件在不同机器上的
+# tree sha 不一致 —— 用 Git Data API 推送时表现为「本地与远端
+# 内容看似相同、diff 却显示整个文件被替换」。
+#
+# 统一为：仓库内一律 LF，工作区在 Linux/macOS 上也是 LF；
+# Windows 上检出时转成 CRLF（eol=crlf 只对文本文件生效）。
+* text=auto eol=lf
+
+*.ts text eol=lf
+*.vue text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.svg text eol=lf
+*.exe binary
+*.dmg binary
+*.deb binary
+*.rpm binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.zst binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
