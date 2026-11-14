@@ -122,19 +122,35 @@ const STAGGER_MS = 120;
  */
 export async function probeFile(url: string): Promise<CacheProbe> {
     const res = await fetch(url, { headers: { Range: "bytes=0-1" } });
-    if (!res.ok && res.status !== 206) {
+
+    /**
+     * 判断「服务端是否支持分段」用的是**状态码**，不是 Accept-Ranges 头。
+     *
+     * 踩过的坑：早先这里读 `Accept-Ranges` 头，缺头就报错「服务端不支持分段下载」。
+     * 但 Cloudflare 会缓存 Worker 的最终响应（响应带 Cache-Control: max-age=86400,
+     * immutable），而缓存里存的是**旧版本 Worker 写入的条目** —— 那批条目没有
+     * 这个头。更麻烦的是每次命中都会刷新 Age，条目因此无限续命、永不过期，
+     * 于是新代码上线后仍持续命中旧条目。
+     *
+     * 状态码则是权威且无歧义的：
+     *   206 → 服务端确实按 Range 截断了内容 → 支持分段
+     *   200 → 服务端忽略了 Range，直接返回整个文件 → 不支持
+     */
+    if (res.status === 200) {
+        // 服务端不支持 Range 时会把整个文件推过来，立刻中止，避免白下几十上百 MB
+        try { await res.body?.cancel(); } catch (e) { /* 忽略 */ }
+        throw new Error("服务端不支持分段下载（请求 Range 后返回的是完整文件）");
+    }
+    if (!res.ok) {
         throw new Error(`无法获取文件信息 (HTTP ${res.status})`);
     }
-    const acceptRanges = (res.headers.get("accept-ranges") || "").toLowerCase();
+
     // 分段响应里总长度在 Content-Range: bytes 0-1/<total> 里
     const contentRange = res.headers.get("content-range") || "";
     const totalFromRange = /\/(\d+)\s*$/.exec(contentRange);
     const total = Number(
         totalFromRange ? totalFromRange[1] : (res.headers.get("content-length") || 0)
     );
-    if (acceptRanges.indexOf("bytes") < 0) {
-        throw new Error("服务端不支持分段下载（缺少 Accept-Ranges）");
-    }
     if (!total) {
         throw new Error("无法获取文件总长度");
     }
@@ -198,8 +214,20 @@ export async function turboDownload(url: string, fileName: string, options: Turb
         const res = await fetch(url, {
             headers: { Range: `bytes=${range.start}-${range.end}` }
         });
-        if (res.status !== 206 && res.status !== 200) {
-            throw new Error(`分段 ${range.start}-${range.end} 请求失败 (HTTP ${res.status})`);
+        /**
+         * 必须严格是 206。
+         *
+         * 早先这里写成「206 或 200 都接受」是个危险的漏洞：
+         * 若服务端忽略了 Range 而返回 200（整个文件），
+         * 后续会把完整文件从 range.start 偏移处写入 —— 下载下来的文件是坏的，
+         * 而且坏得不容易被发现（大小对不上、内容错位）。
+         * 宁可明确失败，也不产出损坏的文件。
+         */
+        if (res.status !== 206) {
+            try { await res.body?.cancel(); } catch (e) { /* 忽略 */ }
+            throw new Error(
+                `分段 ${range.start}-${range.end} 请求失败 (HTTP ${res.status}，预期 206 分段响应)`
+            );
         }
         if (!res.body) throw new Error("响应没有可读流");
 

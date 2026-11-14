@@ -1053,11 +1053,18 @@ async function downloadProxyInner(request: Request, proxyConfig: { [key: string]
 
     // 跨域与计时
     responseHeaders.set("access-control-allow-origin", "*");
+    // 暴露给前端读取的头。x-proxy-cache-status 用于判断文件是否已在边缘缓存，
+    // 少了它跨域场景下前端只能看到 UNKNOWN，无法给出「建议多线程/建议普通下载」的提示。
     responseHeaders.set("access-control-expose-headers",
-        "Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Content-Disposition");
+        "Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified, Content-Disposition, X-Proxy-Cache-Status");
     responseHeaders.set("timing-allow-origin", "*");
 
-    // 分段下载能力声明
+    /**
+     * 分段下载能力声明。
+     *
+     * 无条件补上：源站（Azure Blob）的 206 响应不一定带这个头，
+     * 而 aria2 / Motrix / IDM 等客户端正是靠它判断能否开多线程。
+     */
     if (!responseHeaders.has("accept-ranges")) {
         responseHeaders.set("accept-ranges", "bytes");
     }

@@ -36,6 +36,30 @@ import {bundleProxyWorker, ProxyEntry, resolveWorkerEntry} from "../proxyWorkerB
 
 const PROXY_PREFIX = "/down/";
 
+/**
+ * 下载链接的版本号。
+ *
+ * 为什么需要它：
+ *
+ * Cloudflare 会缓存 Worker 的**最终响应**（响应带 `Cache-Control: max-age=86400,
+ * immutable` 时），缓存键是完整 URL。而 Worker 里那些「补齐响应头」的逻辑
+ * 只在缓存未命中、Worker 真正执行时才会生效 —— 缓存命中时直接返回旧条目。
+ *
+ * 更麻烦的是每次命中都会刷新 Age，旧条目因此**无限续命、永不过期**：
+ * 代码更新上线后，新版本仍然持续命中旧条目，响应头里就一直缺着新加的字段。
+ *
+ * 实测踩到过：补 `Accept-Ranges: bytes` 的逻辑早已上线，
+ * 但站点给出的下载链接仍命中旧条目，浏览器读不到该头，
+ * 于是前端误判「服务端不支持分段下载」而报错。
+ *
+ * 解决办法：给链接加一个版本参数。版本一变，URL 就变，缓存键随之改变，
+ * Worker 必然重新执行、老条目不再被使用。
+ *
+ * **维护规则**：改动 Worker 的响应头构造（新增/修改任何响应头）时，
+ * 必须把这里的版本号 +1，否则用户会继续命中旧条目。
+ */
+const PROXY_VERSION = 2;
+
 /** 代理条目的键 -> 条目 */
 const proxyConfig: { [key: string]: ProxyEntry } = {};
 
@@ -131,7 +155,8 @@ async function cloudflarePagesDownProxyInner(sourceUrl: string, fileName: string
     if (!Object.prototype.hasOwnProperty.call(proxyConfig, legacyKey)) {
         proxyConfig[legacyKey] = entry;
     }
-    return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName);
+    // 版本参数用于绕开 Cloudflare 对旧响应条目的缓存（见 PROXY_VERSION 的说明）
+    return PROXY_PREFIX + key + "/" + encodeURIComponent(fileName) + "?v=" + PROXY_VERSION;
 }
 
 function cloudflarePagesDownProxy(): DownProxy {
