@@ -137,74 +137,50 @@ const MAX_THREADS = 8;
  *   冷缓存下让用户点下去，注定是更慢的结果。
  */
 export async function probeFile(url: string): Promise<CacheProbe> {
-    const res = await fetch(url, { headers: { Range: "bytes=0-1" } });
-
     /**
-     * 判断「服务端是否支持分段」用的是**状态码**，不是 Accept-Ranges 头。
+     * 探测用「完整 GET + 立即中止响应体」，而不是 Range 请求。
      *
-     * 踩过的坑：早先这里读 `Accept-Ranges` 头，缺头就报错「服务端不支持分段下载」。
+     * 原因一：Range 请求命中边缘缓存时，Cloudflare 会按 Range 变体分别缓存，
+     *   从 Range 探测的结果**判断不出完整对象是否已在缓存里**。
      *
-     * 实测结论（同一文件、同一服务端逻辑）：
-     *   不带 Range 的 200 响应 → 有 `Accept-Ranges: bytes`
-     *   带 Range 的 206 响应   → **没有该头**
+     * 原因二：完整 GET 会把完整对象真正灌进边缘缓存（客户端中止也不影响
+     *   Cloudflare 继续回源并缓存）—— 所以这一次探测顺带就把缓存预热了，
+     *   探测结束时缓存已经就绪，多线程立刻可用。
      *
-     * 原因：Cloudflare 接管缓存后由自己处理 Range 语义，不再透传这个头
-     * （响应不被缓存、cf-cache-status 为 DYNAMIC 时才原样透传）。
-     * 另外缓存里还可能存着旧版本 Worker 写入的响应快照，
-     * 那种条目更是缺这个头。
-     *
-     * 状态码则没有歧义：
-     *   206 → 服务端确实按 Range 截断了内容 → 支持分段
-     *   200 → 服务端忽略了 Range，直接返回整个文件 → 不支持
+     * 查询串加随机数：让每次探测都绕开 Cloudflare 对 Worker 响应的那层缓存，
+     * 强制 Worker 真正执行，从而拿到**当前**的缓存状态。
+     * 不加的话第二次探测会命中当初缓存的响应快照，
+     * 里面的状态是写入那一刻的陈旧值（实测踩过：明明已缓存却显示未缓存）。
      */
-    if (res.status === 200) {
-        // 服务端不支持 Range 时会把整个文件推过来，立刻中止，避免白下几十上百 MB
-        try { await res.body?.cancel(); } catch (e) { /* 忽略 */ }
-        throw new Error("服务端不支持分段下载（请求 Range 后返回的是完整文件）");
-    }
+    const probeUrl = url
+        + (url.indexOf("?") >= 0 ? "&" : "?")
+        + "_probe=" + Math.random().toString(36).slice(2);
+
+    const res = await fetch(probeUrl);
     if (!res.ok) {
         throw new Error(`无法获取文件信息 (HTTP ${res.status})`);
-    }
-
-    // 分段响应里总长度在 Content-Range: bytes 0-1/<total> 里
-    const contentRange = res.headers.get("content-range") || "";
-    const totalFromRange = /\/(\d+)\s*$/.exec(contentRange);
-    const total = Number(
-        totalFromRange ? totalFromRange[1] : (res.headers.get("content-length") || 0)
-    );
-    if (!total) {
-        throw new Error("无法获取文件总长度");
     }
 
     /**
      * 缓存状态读 `cf-cache-status`，**不是** `x-proxy-cache-status`。
      *
      * 这两个头说的不是一回事：
-     *   cf-cache-status         → Cloudflare 边缘缓存**当前是否命中**
-     *                            （CF 自己重写，永远反映真实状态）
-     *   x-proxy-cache-status   → Worker 内部**回源层**的状态
-     *
-     * 实测踩过的坑：曾经用 x-proxy-cache-status 判断，结果多线程永远被禁用。
-     * 原因是 Cloudflare 会缓存 Worker 的**最终响应**，命中时 Worker 根本不执行，
-     * 直接返回当初缓存的响应快照 —— 快照里的 x-proxy-cache-status
-     * 是写入那一刻的陈旧值（比如当时是 MISS），之后再也没更新过。
-     *
-     * 而 cf-cache-status 由 CF 在每次返回缓存响应时重写，值永远正确。
-     *
-     * 取值含义：
-     *   HIT      → 命中边缘缓存，Range 能直接从完整对象切出 → 多线程有效
-     *   MISS     → 缓存已过期需回源 → 各分段独立回源 → 多线程更慢
-     *   DYNAMIC  → 不走缓存 → 同上
-     *   BYPASS   → 强制回源 → 同上
-     *   EXPIRED  → 陈旧数据，保守当作冷
+     *   cf-cache-status       → Cloudflare 边缘缓存**当前是否命中**
+     *                          （由 CF 每次返回缓存响应时重写，值永远正确）
+     *   x-proxy-cache-status → Worker 内部**回源层**的状态。
+     *                          Pages 层缓存命中时 Worker 根本不执行，
+     *                          响应是旧快照，这个头是写入那刻的陈旧值 —— 不可用。
      */
-    const raw = (res.headers.get("cf-cache-status")
-        || res.headers.get("x-proxy-cache-status")
-        || "UNKNOWN").toUpperCase();
-    const cached = raw === "HIT";
-    // 读掉 2 字节响应体，保持连接干净
-    try { await res.arrayBuffer(); } catch (e) { /* 忽略 */ }
-    return { total, cached, raw };
+    const raw = (res.headers.get("cf-cache-status") || "UNKNOWN").toUpperCase();
+    const total = Number(res.headers.get("content-length") || 0);
+
+    // 立刻中止传输：只要响应头，不要文件内容
+    try { await res.body?.cancel(); } catch (e) { /* 忽略 */ }
+
+    if (!total) {
+        throw new Error("无法获取文件总长度");
+    }
+    return { total, cached: raw === "HIT", raw };
 }
 
 /**
