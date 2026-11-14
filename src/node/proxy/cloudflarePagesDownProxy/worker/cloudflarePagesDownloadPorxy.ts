@@ -710,6 +710,63 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     }
 
     /**
+     * 正在回源中的源地址集合（模块级）。
+     *
+     * 多线程下载场景下，同一个文件的 N 个分段请求会同时到达。
+     * 冷缓存时它们会各自 MISS 并**各自回源整个文件** ——
+     * 8 线程下载 164MB 就是 8×164MB 的回源流量，
+     * 既拖慢自己，也会把源站打爆。
+     *
+     * 这里做同址去重：第一个请求正常回源，其余请求等待它把
+     * 边缘缓存填好，然后重新请求 —— 那时就会命中缓存。
+     */
+    const inflightOrigins = new Set<string>();
+
+    /** 判断响应是否来自边缘缓存 */
+    function isCacheHit(response: Response): boolean {
+        const status = response.headers.get("cf-cache-status");
+        return status === "HIT" || status === "EXPIRED" || status === "REVALIDATED";
+    }
+
+    /** 等待指定的毫秒数 */
+    function sleep(ms: number): Promise<void> {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /**
+     * 带同址去重的回源。
+     *
+     * 同一 isolate 内、同一源地址的并发请求只会有一个真正回源，
+     * 其余的等待缓存填充后重新请求并命中边缘缓存。
+     */
+    async function fetchOriginDedup(
+        candidates: Array<{ url: string; headers: Headers; cacheKey?: string }>,
+        onUse?: (candidate: { url: string; headers: Headers; cacheKey?: string }) => void,
+        bypassCache?: boolean
+    ): Promise<Response | undefined> {
+        const primary = candidates.length > 0 ? candidates[0].url : "";
+        // 强制回源（?fresh=1）不走去重，否则就失去了强制的意义
+        if (!bypassCache && primary && inflightOrigins.has(primary)) {
+            // 有同址请求正在回源，等待缓存填充后重试
+            for (let i = 0; i < 12; i++) {
+                await sleep(400);
+                const retry = await fetchOrigin(candidates, onUse, bypassCache);
+                if (!retry) return undefined;
+                if (isCacheHit(retry)) return retry;
+                // 仍未命中，放弃等待，直接用这个响应（内容依然正确）
+                return retry;
+            }
+        }
+
+        if (primary && !bypassCache) inflightOrigins.add(primary);
+        try {
+            return await fetchOrigin(candidates, onUse, bypassCache);
+        } finally {
+            if (primary && !bypassCache) inflightOrigins.delete(primary);
+        }
+    }
+
+    /**
      * 依次尝试若干个源地址，返回第一个可用响应。
      *
      * 5xx/504 多为源站侧对当前出口 IP 的拒绝，404 则可能是该条路径
@@ -858,7 +915,7 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     let originResponse: Response;
     let usedSignedUrl = false;
     try {
-        const result = await fetchOrigin(candidates, function (candidate) {
+        const result = await fetchOriginDedup(candidates, function (candidate) {
             usedSignedUrl = candidate.url !== entry.url;
         }, wantFresh);
         if (!result) {
