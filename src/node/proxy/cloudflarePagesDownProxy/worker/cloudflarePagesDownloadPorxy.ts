@@ -137,6 +137,9 @@ export async function loadProxyConfigFromKV(
         // 默认 60 秒会让新版本的下载链接在部分节点短暂 404。
         const raw = await kv.get(KV_TABLE_KEY, { type: "text", cacheTtl: 30 });
         if (typeof raw !== "string" || raw.length === 0) return fallback;
+        // 记录原始体积，供诊断端点观测 KV 单值用量
+        // （单值上限 25 MiB，实测超过会被 API 以 HTTP 413 拒绝）
+        proxyTableBytes = raw.length;
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== "object") return fallback;
         // 合并：KV 为最新数据，内联表作为兜底（KV 中缺失的条目仍可解析）
@@ -233,6 +236,14 @@ const signedUrlCache = new Map<string, ModuleCacheEntry<string>>();
 /** KV 代理表的模块级缓存 */
 let proxyTableCache: ModuleCacheEntry<{ [key: string]: ProxyEntry }> | undefined;
 
+/**
+ * 最近一次从 KV 读到的代理表原始字节数。
+ *
+ * KV 单值上限 25 MiB（实测 25 MiB 可写、26 MiB 被 HTTP 413 拒绝），
+ * 这个数字用于诊断端点展示当前占用比例，便于提前发现逼近上限的情况。
+ */
+let proxyTableBytes = 0;
+
 /** GitHub 令牌的模块级缓存 */
 let tokenCache: ModuleCacheEntry<string> | undefined;
 
@@ -319,6 +330,13 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
     // 否则会被静态资源路由接管，永远到不了这里。
     if (url.pathname.split("/").filter(Boolean).indexOf("_diag") >= 0
         && url.pathname.indexOf("/down/") === 0) {
+        // 主动读一次 KV，让体积数据在首次访问时就是真实的。
+        // 诊断端点是人工访问、频率极低，且 KV 自带 30 秒边缘缓存，代价可忽略。
+        try {
+            await loadProxyConfigFromKV(kv, proxyConfig);
+        } catch (error) {
+            // 读取失败不影响诊断端点本身
+        }
         const info = detectClientFamily(request);
         const cf = (request as any).cf || {};
         return new Response(JSON.stringify({
@@ -336,6 +354,14 @@ export async function downloadProxy(request: Request, proxyConfig: { [key: strin
                 signedUrlCount: signedUrlCache.size,
                 proxyTableCached: readModuleCache(proxyTableCache) !== undefined,
                 tokenCached: readModuleCache(tokenCache) !== undefined
+            },
+            kvUsage: {
+                // KV 单值上限 25 MiB
+                tableBytes: proxyTableBytes,
+                tableLimitBytes: 25 * 1024 * 1024,
+                tableUsagePercent: proxyTableBytes > 0
+                    ? Number(((proxyTableBytes / (25 * 1024 * 1024)) * 100).toFixed(3))
+                    : 0
             }
         }, null, 2), {
             headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }

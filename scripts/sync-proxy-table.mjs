@@ -127,6 +127,33 @@ async function main() {
 
     const namespaceId = await resolveNamespaceId(accountId);
     const value = JSON.stringify(table);
+
+    /**
+     * KV 单值体积守卫。
+     *
+     * Workers KV 单个值的上限是 25 MiB，超过会直接被 API 拒绝：
+     *   HTTP 413 {"code":10024,"message":"Value size ... exceeds maximum allowed size of 25MiB"}
+     * 实测 25 MiB 可写入、26 MiB 被拒。
+     *
+     * 这个失败是「响亮」的 —— 同步作业会明确报错，线上继续用旧代理表，
+     * 不会静默损坏。但一旦到了上限，新版本就发布不出去，
+     * 所以提前在流水线里给出预警。
+     */
+    const VALUE_LIMIT = 25 * 1024 * 1024;
+    const usage = value.length / VALUE_LIMIT;
+    if (value.length > VALUE_LIMIT) {
+        throw new Error(
+            `代理表 ${value.length} 字节已超过 KV 单值上限 ${VALUE_LIMIT} 字节 (${(usage * 100).toFixed(1)}%)，` +
+            `KV 会以 HTTP 413 拒绝写入。需要把代理表分片存储。`
+        );
+    }
+    if (usage > 0.5) {
+        log(`⚠ 代理表已占 KV 单值上限的 ${(usage * 100).toFixed(1)}%` +
+            `（${value.length} / ${VALUE_LIMIT} 字节），接近上限时需要考虑分片存储`);
+    } else {
+        log(`代理表体积 ${value.length} 字节，占 KV 单值上限的 ${(usage * 100).toFixed(2)}%`);
+    }
+
     await cf(`/accounts/${accountId}/storage/kv/namespaces/${namespaceId}/values/${KV_TABLE_KEY}`, {
         method: "PUT",
         body: value
