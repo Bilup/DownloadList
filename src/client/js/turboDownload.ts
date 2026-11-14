@@ -147,16 +147,11 @@ export async function probeFile(url: string): Promise<CacheProbe> {
      *   Cloudflare 继续回源并缓存）—— 所以这一次探测顺带就把缓存预热了，
      *   探测结束时缓存已经就绪，多线程立刻可用。
      *
-     * 查询串加随机数：让每次探测都绕开 Cloudflare 对 Worker 响应的那层缓存，
-     * 强制 Worker 真正执行，从而拿到**当前**的缓存状态。
-     * 不加的话第二次探测会命中当初缓存的响应快照，
-     * 里面的状态是写入那一刻的陈旧值（实测踩过：明明已缓存却显示未缓存）。
+     * **不要加随机查询串**。加了反而会自己把缓存键变成新的，
+     * cf-cache-status 必然是 MISS —— 而 cf-cache-status 是由 Cloudflare
+     * 在每次返回响应时重写的，本来就永远准确，不需要强制 Worker 执行。
      */
-    const probeUrl = url
-        + (url.indexOf("?") >= 0 ? "&" : "?")
-        + "_probe=" + Math.random().toString(36).slice(2);
-
-    const res = await fetch(probeUrl);
+    const res = await fetch(url);
     if (!res.ok) {
         throw new Error(`无法获取文件信息 (HTTP ${res.status})`);
     }
@@ -165,8 +160,8 @@ export async function probeFile(url: string): Promise<CacheProbe> {
      * 缓存状态读 `cf-cache-status`，**不是** `x-proxy-cache-status`。
      *
      * 这两个头说的不是一回事：
-     *   cf-cache-status       → Cloudflare 边缘缓存**当前是否命中**
-     *                          （由 CF 每次返回缓存响应时重写，值永远正确）
+     *   cf-cache-status       → Cloudflare 边缘缓存**当前是否命中**，
+     *                          由 CF 每次返回缓存响应时重写，值永远正确
      *   x-proxy-cache-status → Worker 内部**回源层**的状态。
      *                          Pages 层缓存命中时 Worker 根本不执行，
      *                          响应是旧快照，这个头是写入那刻的陈旧值 —— 不可用。
